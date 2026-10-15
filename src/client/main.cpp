@@ -29,6 +29,7 @@
 #include "MpvController.h"
 #include "PlayerViewModel.h"
 #include "RpcServer.h"
+#include "SessionIdle.h"
 
 extern "C" {
 VkResult vkDeviceWaitIdle(VkDevice);
@@ -139,11 +140,30 @@ int main(int argc, char *argv[]) {
     std::string vf = viewModel.vfOption();
 
     // ── mpv ─────────────────────────────────────────────────────────────
+    // 启动目标的历史进度判定必须在 mpv 初始化之前：有历史进度 → 以暂停态
+    // 起步（mpv 仍恢复位置，但不自动播放）。判定用的路径字符串与随后
+    // loadfile 的完全一致（watch_later 条目名是路径的 MD5，见
+    // PlayerViewModel::hasResumeState）。用户经 `-- --pause=...` 显式指定时
+    // 以命令行优先（mpv 语义：命令行 > 配置）。
+    bool startPaused = false;
+    if (!opts.benchmark) {
+        bool explicitPause = false;
+        for (const auto &kv : opts.passthrough)
+            if (kv.first == "pause") explicitPause = true;
+        const QString target = !opts.video_file.empty()
+            ? QString::fromLocal8Bit(opts.video_file.c_str())
+            : viewModel.restoredCurrentFile();
+        if (!explicitPause && !target.isEmpty() && PlayerViewModel::hasResumeState(target)) {
+            startPaused = true;
+            MLOG_INFO("resume state found → start paused: %s", target.toUtf8().constData());
+        }
+    }
+
     MpvController mpv;
     int num_dev_exts = 0;
     const char *const *dev_exts = vk.deviceExtensions(&num_dev_exts);
     if (!mpv.init(vk.instance(), vk.physicalDevice(), vk.device(),
-                  vk.queueFamilyIndex(), opts.benchmark, opts.hwaccel,
+                  vk.queueFamilyIndex(), opts.benchmark, opts.hwaccel, startPaused,
                   vf.c_str(), opts.passthrough, vk.features(),
                   dev_exts, num_dev_exts))
         return 1;
@@ -249,6 +269,36 @@ int main(int argc, char *argv[]) {
 
         MLOG_INFO("Video wired");
 
+        // ── 播放期会话行为：防息屏 + 指针自动隐藏 ────────────────────
+        // 两者都只在"确实在播放"时生效（playing && hasFile——mpv 的 pause
+        // 属性初值会让 playing 在装载文件前短暂为 true）；UI 覆盖层可见
+        //（底部/顶部热区、弹窗——QML 已写回 viewModel.overlaysVisible）期间
+        // 不隐藏指针，与 mpv --cursor-autohide 的 OSC 语义一致。
+        // benchmark 不参与（测量口径）。
+        IdleInhibitor idleInhibitor(&view);
+        CursorAutoHide cursorAutoHide(&view);
+        if (!opts.benchmark) {
+            auto syncSessionIdle = [&]() {
+                const bool playing = viewModel.playing() && viewModel.hasFile();
+                idleInhibitor.setActive(playing);
+                cursorAutoHide.setEnabled(playing);
+                cursorAutoHide.setSuspended(viewModel.overlaysVisible());
+            };
+            QObject::connect(&viewModel, &PlayerViewModel::playingChanged,
+                             &app, syncSessionIdle);
+            QObject::connect(&viewModel, &PlayerViewModel::overlaysVisibleChanged,
+                             &app, syncSessionIdle);
+            // 直播/线性流：resume 不适用 → 撤销启动时的自动暂停，直接跟最新
+            QObject::connect(&viewModel, &PlayerViewModel::liveSourceDetected,
+                             &app, [&viewModel, startPaused]() {
+                if (startPaused && !viewModel.playing()) {
+                    MLOG_INFO("live source: cancelling start-paused, following live edge");
+                    viewModel.setPaused(false);
+                }
+            });
+            syncSessionIdle();   // 初始状态（恢复播放时 mpv 可能已 pause）
+        }
+
         // ── rife 状态行 → OSD ────────────────────────────────────────
         // rife filter 每 ~0.5s 输出 MSGL_STATUS 状态行（"fruc-status:"
         // 前缀），事件线程提取后存入 viewModel，osdTextString 拼入 OSD。
@@ -261,6 +311,11 @@ int main(int argc, char *argv[]) {
             } else if (strncmp(text, "vsr-status:", 11) == 0) {
                 viewModel.setVsrStatus(text + 11);
                 fprintf(stderr, "[mpv status] %s", text);
+            } else if (strstr(text, "Cannot seek")) {
+                // 直播/线性流：mpv 拿上次保存的位置去 seek 广播流的滑动窗口
+                //（stream.c "Cannot seek backward in linear streams!" /
+                // demux.c "Cannot seek in this file."）→ 按直播处理。
+                viewModel.noteLiveSeekFailure();
             }
         });
 
@@ -365,7 +420,14 @@ int main(int argc, char *argv[]) {
         // 同步命令与事件线程的 mpv API 调用由 core lock 串行化，安全；
         // 防挂死兜底 = vo_libmpv flip_page 的 200ms 超时（等待 render/
         // report_swap 有界，core 不会无限持锁）。
-        mpv.commandStr("quit-watch-later");
+        if (viewModel.isLiveSource()) {
+            // 直播/线性流不写位置——否则下次启动会再拿陈旧 start 去 seek
+            //（每次启动重演一轮 "Cannot seek backward in linear streams!"）
+            mpv.commandStr("delete-watch-later-config");
+            mpv.commandStr("quit");
+        } else {
+            mpv.commandStr("quit-watch-later");
+        }
         // 按文件轨道记忆不参与退出落盘：即时落盘已随每个轨道设置动作
         // 写盘（2026-08-06：关闭落盘/启动加载生命周期排除基于文件的设置）
 
