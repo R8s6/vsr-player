@@ -325,7 +325,7 @@ static bool engine_create(struct mp_filter *f, struct priv *p, int w, int h)
     double t0 = truehdr_now_ms();
     int lr = pfn_NvVFX_Load(p->effect);
     if (lr != 0) {
-        MP_ERR(f, "truehdr: NvVFX_Load failed (%d) — 上变换不可用，直通\n", lr);
+        MP_ERR(f, "truehdr: NvVFX_Load failed (%d) -- upconversion unavailable, passthrough\n", lr);
         engine_destroy(p);
         return false;
     }
@@ -359,7 +359,7 @@ static bool engine_params_apply(struct mp_filter *f, struct priv *p)
 {
     const struct vf_truehdr_opts *o = p->opts;
     if (p->e_debanding_off != o->debanding_off) {
-        MP_INFO(f, "truehdr: debanding %d -> %d（重建引擎；该参数是 Load 期行为）\n",
+        MP_INFO(f, "truehdr: debanding %d -> %d (rebuilding engine; this parameter is Load-time)\n",
                 p->e_debanding_off, o->debanding_off);
         return false;
     }
@@ -377,10 +377,10 @@ static bool engine_params_apply(struct mp_filter *f, struct priv *p)
     if (p->e_luminance != o->luminance)
         ok &= pfn_NvVFX_SetU32(p->effect, "Luminance", (unsigned)o->luminance) == 0;
     if (!ok) {
-        MP_WARN(f, "truehdr: SetU32 失败 → 重建引擎兜底\n");
+        MP_WARN(f, "truehdr: SetU32 failed -> falling back to engine rebuild\n");
         return false;
     }
-    MP_VERBOSE(f, "truehdr: params %d/%d/%d/%d -> %d/%d/%d/%d (SetU32, 无重建)\n",
+    MP_VERBOSE(f, "truehdr: params %d/%d/%d/%d -> %d/%d/%d/%d (SetU32, no rebuild)\n",
                p->e_contrast, p->e_saturation, p->e_middle_gray, p->e_luminance,
                o->contrast, o->saturation, o->middle_gray, o->luminance);
     p->e_contrast = o->contrast;
@@ -598,7 +598,7 @@ static void f_process(struct mp_filter *f)
     }
     if (content_hdr) {
         if (!p->hdr_warned) {
-            MP_INFO(f, "truehdr: HDR 内容（transfer=%d primaries=%d）— 直通，不做上变换\n",
+            MP_INFO(f, "truehdr: HDR content (transfer=%d primaries=%d) -- passthrough, no upconversion\n",
                     (int)mpi->params.color.transfer, (int)mpi->params.color.primaries);
             p->hdr_warned = true;
         }
@@ -651,7 +651,7 @@ static void f_process(struct mp_filter *f)
         if (!engine_create(f, p, w, h)) {
             p->failed = true;
             if (!p->failed_warned) {
-                MP_WARN(f, "truehdr: 上变换不可用 — 直通（不再重试）\n");
+                MP_WARN(f, "truehdr: upconversion unavailable -- passthrough (no retry)\n");
                 p->failed_warned = true;
             }
             cuCtxPopCurrent(NULL);
@@ -742,7 +742,7 @@ static void f_process(struct mp_filter *f)
 
     // ── 上变换 ──────────────────────────────────────────────────────────
     if (pfn_NvVFX_Run(p->effect, 0) != 0) {
-        MP_ERR(f, "truehdr: NvVFX_Run failed — 直通并停用\n");
+        MP_ERR(f, "truehdr: NvVFX_Run failed -- passthrough and disabled\n");
         p->failed = true;
         cuCtxPopCurrent(NULL);
         mp_pin_in_write(f->ppins[1], frame);
@@ -882,7 +882,7 @@ static bool truehdr_command(struct mp_filter *f, struct mp_filter_command *cmd)
         int v;
         if (!parse_bool_arg(cmd->arg, &v)) return false;
         if (o->debanding_off != v) {
-            MP_WARN(f, "truehdr: debanding-off %d -> %d (诊断用；默认恒 0)\n",
+            MP_WARN(f, "truehdr: debanding-off %d -> %d (diagnostic only; always 0 by default)\n",
                     o->debanding_off, v);
             o->debanding_off = v;
         }
@@ -966,7 +966,7 @@ static struct mp_filter *vf_truehdr_create(struct mp_filter *parent, void *optio
     p->opts = talloc_steal(p, options);
 
     if (!vfx_load_libraries()) {
-        MP_ERR(f, "truehdr: VFX 库加载失败 — 直通\n");
+        MP_ERR(f, "truehdr: failed to load the VFX libraries -- passthrough\n");
         p->failed = true;
         p->failed_warned = true;
     }

@@ -351,10 +351,11 @@ void PlayerViewModel::attach(MpvController *mpv) {
                     hdrMeta_.maxCll != meta.maxCll ||
                     hdrMeta_.maxFall != meta.maxFall) {
                     hdrMeta_ = meta;
-                    MLOG_INFO("video-params: HDR10 元数据 mastering %.4f-%.0f nit, "
-                              "max_cll=%.0f, max_fall=%.0f（%s）",
+                    MLOG_INFO("video-params: HDR10 metadata mastering %.4f-%.0f nit, "
+                              "max_cll=%.0f, max_fall=%.0f (%s)",
                               meta.minMastering, meta.maxMastering, meta.maxCll,
-                              meta.maxFall, meta.valid ? "有效" : "无 → 合成器按 10000nit 口径");
+                              meta.maxFall,
+                              meta.valid ? "valid" : "absent -> compositor assumes 10000 nit");
                     emit videoHdrMetaChanged();
                 }
             });
@@ -1256,12 +1257,13 @@ void PlayerViewModel::initAiAvailability(bool available, const std::string &reas
         emit aiAvailableChanged();
     }
     if (!available) {
-        MLOG_WARN("AI 处理不可用：%s", reason.c_str());
-        MLOG_WARN("  → 超分/插帧/SDR→HDR10 上变换本次运行强制直通（不改持久化设置）；"
-                  "要用请让 Vulkan 与 CUDA 落在同一张卡（笔记本通常需独显直连/"
-                  "PRIME 渲染卸载，或去掉 CUDA_VISIBLE_DEVICES）");
+        MLOG_WARN("AI processing unavailable: %s", reason.c_str());
+        MLOG_WARN("  -> upscaling/interpolation/SDR->HDR10 are forced to passthrough for this run "
+                  "(persisted settings are untouched). To use them, make Vulkan and CUDA land on "
+                  "the same GPU (laptops usually need dGPU-only mode / PRIME render offload, "
+                  "or drop CUDA_VISIBLE_DEVICES)");
     } else {
-        MLOG_INFO("AI 处理可用：%s", reason.c_str());
+        MLOG_INFO("AI processing available: %s", reason.c_str());
     }
 }
 
@@ -1270,7 +1272,7 @@ bool PlayerViewModel::aiAllowed(const char *what) {
     static bool warned = false;
     if (!warned) {
         warned = true;
-        MLOG_WARN("AI 不可用（%s）：忽略后续 %s 等设置请求",
+        MLOG_WARN("AI unavailable (%s): ignoring subsequent %s etc. settings",
                   aiUnavailableReason_.c_str(), what);
     }
     return false;
@@ -1839,8 +1841,8 @@ std::string PlayerViewModel::vfOption() const {
         static bool pre_warned = false;
         if (!pre_warned) {
             pre_warned = true;
-            fprintf(stderr, "[truehdr] --fruc-order pre 下不支持上变换（方案 §8.1），"
-                            "该序未插入 truehdr 滤镜\n");
+            fprintf(stderr, "[truehdr] upconversion is not supported with --fruc-order pre "
+                            "(design §8.1); the truehdr filter is not inserted in this order\n");
         }
         return hwup + "," + vfg + "," + vsr;
     }
@@ -1939,7 +1941,7 @@ void PlayerViewModel::setUpconvert(bool on, float autoNit, float effectiveNit) {
     if (!changed)
         return;   // 幂等（策略重算会反复触发）
 
-    MLOG_INFO("truehdr: 上变换 %s（面板峰值 %.0f nit，生效峰值 %.0f nit）",
+    MLOG_INFO("truehdr: upconversion %s (panel peak %.0f nit, effective peak %.0f nit)",
               on ? "on" : "off", (double)autoNit, (double)effectiveNit);
     // 链上恒有 truehdr 滤镜（vfOption 里 enable=no 占位）→ 运行期开关只改
     // filter 实例选项，不重建链；引擎按需 lazy init（首帧 ~120ms）。
@@ -1997,11 +1999,11 @@ void PlayerViewModel::initTrueHdr() {
     hdr::setUpconvertInChain(!frucOrderPre());
     hdr::setUpconvertOptIn(upHdrEnabled_);
     hdr::setUpconvertLuminanceOverride(upHdrLumOverride_, upHdrLuminance_);
-    MLOG_INFO("truehdr: 参数 = %s，saturation=%d contrast=%d middle-gray=%d "
-              "debanding=%s，峰值=%s", upHdrEnabled_ ? "on" : "off",
+    MLOG_INFO("truehdr: params = %s, saturation=%d contrast=%d middle-gray=%d "
+              "debanding=%s, peak=%s", upHdrEnabled_ ? "on" : "off",
               upHdrSaturation_, upHdrContrast_, upHdrMiddleGray_,
               upHdrDebanding_ ? "on" : "off(diagnostic)",
-              upHdrLumOverride_ ? "用户覆盖" : "自动跟面板");
+              upHdrLumOverride_ ? "user override" : "auto (panel)");
 }
 
 void PlayerViewModel::setUpHdrEnabled(bool on) {
@@ -2010,7 +2012,7 @@ void PlayerViewModel::setUpHdrEnabled(bool on) {
     upHdrEnabled_ = on;
     emit upHdrEnabledChanged();
     saveSettings("upHdrEnabled", on);
-    MLOG_INFO("truehdr: 用户开关 → %s", on ? "on" : "off");
+    MLOG_INFO("truehdr: user switch -> %s", on ? "on" : "off");
     // 策略重算 → 目标模式可能随之切换（SDR 内容 × HDR 屏 × opt-in → Hdr10），
     // 最终 enable 由策略回调 setUpconvert 下发。
     hdr::setUpconvertOptIn(on);
@@ -2077,8 +2079,8 @@ void PlayerViewModel::setUpHdrDebanding(bool on) {
     upHdrDebanding_ = on;
     emit upHdrDebandingChanged();
     saveSettings("upHdrDebanding", on);
-    MLOG_INFO("truehdr: 抗色带 → %s（默认开；关闭会让带色带的镜头暴露，"
-              "引擎耗时约 1.6–4.3×）", on ? "on" : "off");
+    MLOG_INFO("truehdr: debanding -> %s (on by default; disabling exposes banding on "
+              "affected shots; engine cost is roughly 1.6-4.3x)", on ? "on" : "off");
     pushVf("truehdr", "debanding-off", on ? "0" : "1");
 }
 
@@ -2148,9 +2150,9 @@ void PlayerViewModel::updateSpeed(double s) {
 void PlayerViewModel::updateHwDecoding(bool hw) {
     if (hwDecoding_.load() != hw) {
         hwDecoding_.store(hw);
-        MLOG_INFO("decoder: 实际 %s → %s（偏好=%s hwdec=%s）",
-                  hw ? "软解" : "硬解", hw ? "硬解" : "软解",
-                  hwDecodeEnabled_.load() ? "硬解" : "软解",
+        MLOG_INFO("decoder: actual %s -> %s (preference=%s hwdec=%s)",
+                  hw ? "software" : "hardware", hw ? "hardware" : "software",
+                  hwDecodeEnabled_.load() ? "hardware" : "software",
                   hwdecInit_.empty() ? "?" : hwdecInit_.c_str());
         emit hwDecodingChanged();
     }
@@ -2180,12 +2182,12 @@ void PlayerViewModel::refreshHwDecodeAvailability(int forceReason) {
     if (hwDecodeAvailable_.load() != avail || hwDecodeReason_.load() != reason) {
         hwDecodeAvailable_.store(avail);
         hwDecodeReason_.store(reason);
-        MLOG_INFO("decoder: 解码切换%s（偏好=%s 实际=%s 解码器=%s）",
-                  avail ? "可用"
-                        : (reason == 1 ? "禁用：此设备无法硬解（CUDA 不可用）"
-                                       : "禁用：该文件只能软解"),
-                  hwDecodeEnabled_.load() ? "硬解" : "软解",
-                  hwDecoding_.load() ? "硬解" : "软解",
+        MLOG_INFO("decoder: decode toggle %s (preference=%s actual=%s decoder=%s)",
+                  avail ? "available"
+                        : (reason == 1 ? "disabled: this device cannot hardware-decode (no CUDA)"
+                                       : "disabled: this file is software-only"),
+                  hwDecodeEnabled_.load() ? "hardware" : "software",
+                  hwDecoding_.load() ? "hardware" : "software",
                   decoderName_.isEmpty() ? "-" : decoderName_.toUtf8().constData());
         emit hwDecodeAvailableChanged();
     }

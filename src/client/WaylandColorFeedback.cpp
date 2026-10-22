@@ -341,7 +341,7 @@ public:
         // 全局可能在首次 vsr_color_fb_init() 之后才绑上 → 这里补做订阅，
         // 否则要等下一次 init 调用（可能很久，画面已经按 SDR 起播）。
         if (attach_feedback() == 0)
-            fprintf(stderr, "vsr-color-fb: surface feedback 已订阅（全局到齐后补做）\n");
+            fprintf(stderr, "vsr-color-fb: surface feedback subscribed (late bind after globals)\n");
     }
 
     struct wp_color_manager_v1 *obj() const { return m_obj; }
@@ -444,7 +444,7 @@ extern "C" int vsr_color_fb_declare_pq(void *qwindow, const struct vsr_hdr_meta 
     if (!g_feat_parametric ||
         !g_tf_supported[WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_ST2084_PQ] ||
         !g_prim_supported[WP_COLOR_MANAGER_V1_PRIMARIES_BT2020]) {
-        fprintf(stderr, "vsr-color-fb: 合成器不支持 parametric/PQ/bt2020 声明\n");
+        fprintf(stderr, "vsr-color-fb: compositor does not support parametric/PQ/bt2020 descriptions\n");
         return -3;
     }
 
@@ -489,13 +489,13 @@ extern "C" int vsr_color_fb_declare_pq(void *qwindow, const struct vsr_hdr_meta 
     }
     wp_color_management_surface_v1_set_image_description(g_csurface, desc, 0);
     if (have_meta) {
-        fprintf(stderr, "vsr-color-fb: 已声明 HDR10（bt2020 + st2084_pq + "
+        fprintf(stderr, "vsr-color-fb: HDR10 declared (bt2020 + st2084_pq + "
                         "luminances 0/10000/203 + mastering %.4f-%.0f nit + "
-                        "max_cll %.0f / max_fall %.0f）\n",
+                        "max_cll %.0f / max_fall %.0f)\n",
                 m.min_mastering, m.max_mastering, m.max_cll, m.max_fall);
     } else {
-        fprintf(stderr, "vsr-color-fb: 已声明 HDR10（bt2020 + st2084_pq + "
-                        "luminances 0/10000/203，mpv 语义；无内容静态元数据）\n");
+        fprintf(stderr, "vsr-color-fb: HDR10 declared (bt2020 + st2084_pq + "
+                        "luminances 0/10000/203, mpv semantics; no content static metadata)\n");
     }
     return 0;
 }
@@ -507,7 +507,7 @@ extern "C" int vsr_color_fb_unset(void *qwindow)
     if (!g_csurface)
         return 0;    /* 从没声明过：本来就是默认 */
     wp_color_management_surface_v1_unset_image_description(g_csurface);
-    fprintf(stderr, "vsr-color-fb: 已撤下自定义色彩描述 → 合成器默认\n");
+    fprintf(stderr, "vsr-color-fb: custom color description removed -> compositor default\n");
     return 0;
 }
 

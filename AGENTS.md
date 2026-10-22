@@ -16,6 +16,11 @@ Linux 桌面视频播放器：**NVIDIA VFX SDK 实时 AI 超分** + **RIFE 插�
 2. **不用 QTimer 解决渲染/事件架构问题**——业务触发器不解决架构问题；唤醒/驱动走框架生命周期钩子。
 3. **字体样式冻结**——不主动改 font family/size/bold，除非用户点名。
 4. **日志纪律**——默认只输出 info 及以上（`all=info`）；级别语义对齐 mpv（INFO=状态变更/VERBOSE=低频诊断/DBG=帧级）；调试用 `--msg-level all=v`（帧级 `all=dbg`），benchmark 用 `all=no`。**不要用 `log-file`**（下限 MSGL_DEBUG 会绕过 msg-level 刷屏）。
+   ⚠ **日志一律用英文，不做 i18n**（用户 2026-10-22 明确要求）：日志是给 issue/bug 报告和跨语言 grep 用的，
+   跟着桌面语言变会让上游反馈里出现无法检索的中文；OSD/UI 文案仍走 `tr()`/`qsTr()`。改动范围 =
+   我们自己的日志（`MLOG_*`、滤镜里的 `MP_INFO/WARN/ERR/VERBOSE/DBG`、`fprintf(stderr, …)`、
+   `CudaProbe`/`HdrOutput` 里拼进日志的 reason 串）；**mpv 上游自己的日志不动**（`third_party/mpv`）。
+   注释仍是中文（不受此约束）。
 5. **视觉瑕疵先排除编码**——任何"涂抹/色块"先出 PNG 帧序列/444 编码对照，再归因模型/引擎（yuv420p 色度下采样曾致 3 个引擎全被误判）。
 6. **不假设画面里"没有 X"**（2026-10-18 用户纠正）——我们处理的是视频，逐帧逐镜头变化：**条件触发的处理项**（抗色带/去抖/去噪/去块等）必须常开，恒定成本+条件收益是设计意图；"样本上看不出差别/逐位无差异"**不构成**关闭或省略的依据。要动这类项，只能用**最坏帧**（已知有该缺陷的素材）+ 目标显示条件下的并排结果来判。
 7. **UI 不自由发挥**（2026-10-18 用户要求）——做界面只用项目里**已有**的设计语言/组件/配色：弹窗用 `PopupBase`、
@@ -33,10 +38,16 @@ Linux 桌面视频播放器：**NVIDIA VFX SDK 实时 AI 超分** + **RIFE 插�
    只留控件标签/标题/单位；"SDK default xx"、"following panel"、状态解释句这类全部去掉，
    参数含义与默认值写在代码注释/文档里。tooltip 也保持项目风格的一句话（如 "Advanced"）。
    ⚠ **新增 UI 文案必须走 i18n**：QML 里一律 `qsTr()`；改完跑
-   `/usr/lib/qt6/bin/lupdate <main.qml ui/*.qml ui/components/*.qml PlayerViewModel.cpp> -ts
-   src/client/translations/vsr-player_{en,zh_CN}.ts`，再补两份译文并 `ninja -C build`
-   （meson 的 custom_target 跑 `lrelease` → `<build>/src/client/*.qm`，`main.cpp` 按 locale
-   经 `VSR_TRANSLATIONS_DIR` 载入；日志会打 `translation: vsr-player_zh_CN`）。
+   `./scripts/update-translations.sh`（= `lupdate -no-obsolete` + 完整输入清单），再补两份译文并
+   `ninja -C build`（meson 的 custom_target 跑 `lrelease` → `<build>/src/client/*.qm`，`main.cpp`
+   按 locale 经 `VSR_TRANSLATIONS_DIR` 载入；日志会打 `translation: vsr-player_zh_CN`），最后
+   `./scripts/update-translations.sh --check` 验收。
+   ⚠ **输入清单必须包含带 `QT_TRANSLATE_NOOP()` 的头**（当前 = `src/client/FrucBackend.h`）：
+   C++ 侧用 `tr(变量)` 翻译档位标签（`frucModel`/`frucQualityModel`/`frucMaxFpsModel`），
+   字符串靠 `QT_TRANSLATE_NOOP("PlayerViewModel", "…")` 标记——lupdate 没吃这个头就看不到它们，
+   条目会 `vanished` → 不进 .qm → **运行时静默回退英文**（2026-10-22 用户报"UI 里插帧选项
+   没做 i18n"：Off/Low/Medium/High 与各档位标签全英，就是这么漏的）。脚本的 `--check`
+   会拿源码里的 `tr("…")/qsTr("…")/QT_TRANSLATE_NOOP(…)` 字面量逐个对 .ts，比数 vanished 更准。
    ⚠ 别漏 `ui/components/*.qml`：新组件（SegToggle/ParamSliderRow）是**独立 context**，
    lupdate 不给这些文件就永远没有译文。lupdate 会顺带刷新所有 `<location line=…>`（diff 大是正常）。
    ⚠ **`tr()` 的参数必须是字面量**：写成 `tr(t)`（t 是形参）lupdate 扫不到 → 该条目被标
@@ -133,11 +144,11 @@ Linux 桌面视频播放器：**NVIDIA VFX SDK 实时 AI 超分** + **RIFE 插�
   decoder`）非空：解码器还没起来时 `refreshHwDecodeAvailability()` **直接 return、
   保持原值**（否则换片瞬间会出现 可用↔禁用 抖动）。
   **状态只靠日志验证，不靠截图/读图**（用户 2026-10-22 要求）：两处 INFO——
-  `decoder: 实际 软解 → 硬解（偏好=… hwdec=nvdec）`（有效状态翻转）与
-  `decoder: 解码切换禁用：该文件只能软解（偏好=… 实际=… 解码器=mpeg4）` /
-  `decoder: 解码切换可用（…）`（可切换性翻转）。实测序列（mpeg4 → h264 → mpeg4）：
-  `禁用：该文件只能软解(实际=软解,mpeg4)` → `实际 软解 → 硬解` + `可用` →
-  `实际 硬解 → 软解` + `禁用`，偏好在全程恒为"硬解"。
+  `decoder: actual software -> hardware (preference=… hwdec=nvdec)`（有效状态翻转）与
+  `decoder: decode toggle disabled: this file is software-only (preference=… actual=… decoder=mpeg4)` /
+  `decoder: decode toggle available (…)`（可切换性翻转）。实测序列（mpeg4 → h264 → mpeg4）：
+  `disabled: this file is software-only(actual=software,mpeg4)` → `actual software -> hardware` + `available` →
+  `actual hardware -> software` + `disabled`，偏好在全程恒为"硬解"。
   ⚠ **不能硬解还要分清"设备层"与"文件层"**（`hwDecodeReason`：0=可切换 1=设备层
   2=文件层，QML tooltip 分支两次 i18n）：设备层 = 这台机器的 Vulkan 设备没有可用的
   CUDA（判据复用 `aiAvailable`；mpv 的 cuda_vk 要求解码设备 = 显示设备，按 UUID 匹配），
@@ -170,10 +181,10 @@ Linux 桌面视频播放器：**NVIDIA VFX SDK 实时 AI 超分** + **RIFE 插�
   OSD `显卡` 行加 `· AI unavailable`，`超分`/`插帧` 行**只在设定确实请求 AI 时**
   追加 ` | AI unavailable`（off 时不加，避免噪音）。
   **验证**（不用双显卡机器：`CUDA_VISIBLE_DEVICES=` 把 CUDA 藏起来即可模拟）：
-  `CUDA_VISIBLE_DEVICES=` → 日志 `GPU: … uuid=` + `AI 处理不可用：… cuInit 失败（100）`
+  `CUDA_VISIBLE_DEVICES=` → 日志 `GPU: … uuid=` + `AI processing unavailable: … cuInit failed (100)`
   + 一行"强制直通"说明；`vf` 为空、播放 2.00 s/2 s、丢帧 0（**不再黑屏**）；
   `set-vsr scale 2` 被拒（WARN 一条）；OSD = `超分 auto High | AI unavailable` /
-  `插帧 off` / `显卡 … · AI unavailable`。正常机（UUID 匹配）→ `AI 处理可用：<同一张卡>`，
+  `插帧 off` / `显卡 … · AI unavailable`。正常机（UUID 匹配）→ `AI processing available: <same card>`，
   链照旧、4K60 + VFG 丢帧 0。
   **hwup 按 UUID 选 CUDA 设备（2026-10-22，C 方案的一部分）**：`vf_hwup` 新增
   `cuda-uuid=` 选项（32 hex），客户端把选中的 Vulkan 设备 UUID 拼进链串
@@ -191,7 +202,7 @@ Linux 桌面视频播放器：**NVIDIA VFX SDK 实时 AI 超分** + **RIFE 插�
   配方与"两条都要指同一张"的说明；两张 N 卡时 `VK_LOADER_DEVICE_SELECT` 实测无效）。
   实测：硬解路径链串带 uuid、hwup 不建 context、播放 2.00 s/2 s 丢帧 0；软解路径打
   `hwup: CUDA 设备按 UUID 匹配 = NVIDIA GeForce RTX 5060 Ti（index 0）`；伪造 UUID →
-  `hwup: CUDA 里没有 UUID 匹配的设备…退回 0 号`。
+  `hwup: no CUDA device with UUID …; falling back to device 0`。
   **未做/边界**：`--gpu` 选卡选项（讨论中，需要时再做）；"CUDA 算 + 另一张卡显示"的
   零拷贝**不可能**，只能每帧回拷（已否决）。
 - **运行中切 hwdec（软↔硬）的连环坑（2026-10-17 修）**：

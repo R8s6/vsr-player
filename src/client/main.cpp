@@ -86,7 +86,7 @@ static bool expandInputs(const Options &opts, std::vector<std::string> *out) {
                 continue;                // 空行 / m3u 注释与 #EXTINF
             out->push_back(line);
         }
-        MLOG_INFO("playlist: %s → %zu 条", in.value.c_str(), out->size() - before);
+        MLOG_INFO("playlist: %s -> %zu entries", in.value.c_str(), out->size() - before);
     }
     return true;
 }
@@ -109,9 +109,9 @@ int main(int argc, char *argv[]) {
     std::vector<std::string> entries;
     if (!expandInputs(opts, &entries)) return 1;
     if (!opts.inputs.empty())
-        MLOG_INFO("inputs: %zu 条（命令行 %zu 项）", entries.size(), opts.inputs.size());
+        MLOG_INFO("inputs: %zu entries (%zu from the command line)", entries.size(), opts.inputs.size());
     if (opts.benchmark && entries.empty()) {
-        MLOG_ERR("benchmark: 输入列表为空");
+        MLOG_ERR("benchmark: empty input list");
         return 1;
     }
 
@@ -186,7 +186,7 @@ int main(int argc, char *argv[]) {
             snprintf(reason, sizeof(reason), "%s ↔ CUDA %s",
                      vk.deviceName(), cuda.matchedName.c_str());
         } else {
-            snprintf(reason, sizeof(reason), "Vulkan 设备 %s 没有 UUID 相同的 CUDA 设备（%s）",
+            snprintf(reason, sizeof(reason), "Vulkan device %s has no CUDA device with the same UUID (%s)",
                      vk.deviceName(), cuda.detail.c_str());
         }
         aiReason = reason;
@@ -303,9 +303,9 @@ int main(int argc, char *argv[]) {
     // 但**软解码**时 hwup 历史上会落在 CUDA 0 号 → 跨卡 → 黑屏。现在 hwup
     // 已按 UUID 选卡（上面透下去的 cuda-uuid），这里只在配置可能踩坑时提醒。
     if (cuda.driverOk && cuda.deviceCount >= 2 && !cuda.dev0Matches) {
-        MLOG_WARN("CUDA 可见 %d 张卡，0 号是「%s」而 Vulkan 设备是「%s」；"
-                  "若要让解码/AI 全在 Vulkan 那张上，建议 CUDA_VISIBLE_DEVICES=GPU-<uuid>"
-                  "（uuid 见上面 GPU: 行或 nvidia-smi -L）",
+        MLOG_WARN("CUDA sees %d devices; device 0 is \"%s\" but the Vulkan device is \"%s\". "
+                  "To keep decoding/AI on the Vulkan card, pin it with "
+                  "CUDA_VISIBLE_DEVICES=GPU-<uuid> (uuid: the GPU: line above, or nvidia-smi -L)",
                   cuda.deviceCount, cuda.dev0Name.c_str(), vk.deviceName());
     }
     // 反交错：CLI `-- --deinterlace=no|auto|yes` 优先于持久化值（本会话生效，
@@ -318,7 +318,7 @@ int main(int argc, char *argv[]) {
             if (m >= 0) {
                 deintCli = m;
             } else {
-                MLOG_WARN("invalid --deinterlace=%s (no|yes|auto)，忽略",
+                MLOG_WARN("invalid --deinterlace=%s (no|yes|auto), ignored",
                           kv.second.c_str());
             }
         }
@@ -453,16 +453,16 @@ int main(int argc, char *argv[]) {
             // 色彩空间与描述交给 HdrOutput：首帧后 `syncTargets()` 设
             // colorSpace（此时 platform window 已存在，Qt 不会再建 surface——
             // 自动切换路径一直如此）+ 我们下发带 luminances/元数据的描述。
-            MLOG_INFO("hdr: 强制 HDR10（VSR_HDR=hdr10）—— _qt_sg_hdr_format=%s, "
-                      "rtImage fmt=%d, composite attachment fmt=%d"
-                      "（色彩空间/描述在首帧后由 hdr 策略下发）",
+            MLOG_INFO("hdr: forcing HDR10 (VSR_HDR=hdr10) -- _qt_sg_hdr_format=%s, "
+                      "rtImage fmt=%d, composite attachment fmt=%d "
+                      "(colorspace/description are sent by the hdr policy after the first frame)",
                       prop, int(renderFmt), int(swapchainFmt));
         } else {
-            MLOG_INFO("hdr: 初始 SDR（策略 %s）%s",
+            MLOG_INFO("hdr: starting in SDR (policy %s) %s",
                       hdrPolicy == hdr::Policy::Auto ? "auto" : "off",
                       hdrPolicy == hdr::Policy::Auto
-                          ? "——内容 HDR × 显示能力 HDR 时运行期切 HDR10"
-                          : "——off：从不切换");
+                          ? "-- switches to HDR10 at runtime when content is HDR and the display supports it"
+                          : "-- off: never switches");
         }
 
         // 能力探测 + 日志（零行为变更）。必须在首帧之前接线
@@ -504,13 +504,13 @@ int main(int argc, char *argv[]) {
                 // rtImage/mpv FBO 格式随 Video（下次 updatePaintNode 立即重建）。
                 if (!compPtr->create(vk.device(), videoPtr->descriptorSetLayout(),
                                      hdr::vkFormatForMode(m))) {
-                    MLOG_ERR("hdr: composite pipeline 重建失败（%s）→ 画面可能不兼容",
+                    MLOG_ERR("hdr: composite pipeline rebuild failed (%s) -- picture may be incompatible",
                              hdr::modeName(m));
                     return;
                 }
                 videoPtr->setRenderFormat(hdr::renderTargetFormatForMode(m));
                 videoPtr->setCompositeObjects(compPtr->pipeline(), compPtr->pipelineLayout());
-                MLOG_INFO("hdr: 渲染链路 → %s（composite attachment=%d rtImage=%d）",
+                MLOG_INFO("hdr: render path -> %s (composite attachment=%d rtImage=%d)",
                           hdr::modeName(m), int(hdr::vkFormatForMode(m)),
                           int(hdr::renderTargetFormatForMode(m)));
             };
@@ -521,13 +521,13 @@ int main(int argc, char *argv[]) {
                 }
                 if (di.haveLuminances && di.peakNits > 0) {
                     mpvPtr->setHdrTarget(true, di.minNits, di.peakNits);
-                    MLOG_INFO("hdr: mpv target ← 合成器 screen=%s peak=%.1f nit min=%.2f nit "
-                              "gamut_area=%.4f（%s）", di.screen.toUtf8().constData(),
+                    MLOG_INFO("hdr: mpv target <- compositor screen=%s peak=%.1f nit min=%.2f nit "
+                              "gamut_area=%.4f (%s)", di.screen.toUtf8().constData(),
                               di.peakNits, di.minNits, di.gamutArea,
                               di.reason.toUtf8().constData());
                 } else {
-                    MLOG_ERR("hdr: 显示能力无亮度信息（valid=%d icc_only=%d）→ mpv target "
-                             "用保守默认 max=1000 nit/min=0", int(di.valid), int(di.iccOnly));
+                    MLOG_ERR("hdr: display has no luminance info (valid=%d icc_only=%d) -- mpv target "
+                             "uses conservative default max=1000 nit/min=0", int(di.valid), int(di.iccOnly));
                     mpvPtr->setHdrTarget(true, 0.0f, 1000.0f);
                 }
             };
@@ -756,7 +756,7 @@ int main(int argc, char *argv[]) {
                 mpv.loadFile(entries[0].c_str());
                 for (size_t i = 1; i < entries.size(); i++)
                     mpv.appendFile(entries[i].c_str());
-                MLOG_INFO("%zu 条输入（首个 %s），entering app.exec()",
+                MLOG_INFO("%zu inputs (first: %s), entering app.exec()",
                           entries.size(), entries[0].c_str());
             } else if (idleStart) {
                 viewModel.restorePlaylistIdle();         // 只填列表，不载入媒体
@@ -765,7 +765,7 @@ int main(int argc, char *argv[]) {
             } else if (!opts.inputs.empty()) {
                 // 显式给了输入但列表为空（空播放列表文件/空 stdin）：
                 // 不载入媒体、也不恢复上次列表（对齐 mpv 空列表 → idle）
-                MLOG_WARN("输入列表为空 → 不载入媒体");
+                MLOG_WARN("empty input list -- no media loaded");
                 MLOG_INFO("empty input list, entering app.exec()");
             } else {
                 viewModel.restorePlaylist();             // 无参数 → 恢复上次列表

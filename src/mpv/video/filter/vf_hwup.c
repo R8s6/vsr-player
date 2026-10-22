@@ -140,7 +140,7 @@ static CUresult pick_cuda_device(struct mp_filter *f, struct priv *p, CUdevice *
     unsigned char want_uuid[16];
     if (!want || !*want || !parse_uuid16(want, want_uuid)) {
         if (want && *want)
-            MP_WARN(f, "hwup: 无法解析 cuda-uuid=\"%s\"，退回 CUDA 0 号设备\n", want);
+            MP_WARN(f, "hwup: cannot parse cuda-uuid=\"%s\", falling back to CUDA device 0\n", want);
         return cuDeviceGet(out, 0);
     }
     int count = 0;
@@ -157,15 +157,16 @@ static CUresult pick_cuda_device(struct mp_filter *f, struct priv *p, CUdevice *
                 char buf[128] = {0};
                 if (cuDeviceGetName(buf, sizeof(buf) - 1, dev) == CUDA_SUCCESS)
                     name = buf;
-                MP_INFO(f, "hwup: CUDA 设备按 UUID 匹配 = %s（index %d）\n", name, i);
+                MP_INFO(f, "hwup: matched CUDA device by UUID: %s (index %d)\n", name, i);
                 *out = dev;
                 return CUDA_SUCCESS;
             }
         }
     }
-    MP_WARN(f, "hwup: CUDA 里没有 UUID 匹配的设备（cuda-uuid=%s），退回 0 号——"
-               "两者不是同一张卡时下游导入会失败（黑屏），请用 "
-               "CUDA_VISIBLE_DEVICES=GPU-<同一张卡的 uuid> 钉住\n", want);
+    MP_WARN(f, "hwup: no CUDA device with UUID %s; falling back to device 0 -- "
+               "if that is a different GPU than Vulkan's, the import fails "
+               "(black picture). Pin it with "
+               "CUDA_VISIBLE_DEVICES=GPU-<uuid of the same card>\n", want);
     return cuDeviceGet(out, 0);
 }
 

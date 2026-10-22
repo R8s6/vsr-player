@@ -4,10 +4,6 @@
 <context>
     <name>AspectPopup</name>
     <message>
-        <source>Auto</source>
-        <translation type="obsolete">Auto</translation>
-    </message>
-    <message>
         <location filename="../ui/AspectPopup.qml" line="29"/>
         <source>No override</source>
         <translation type="unfinished"></translation>
@@ -196,26 +192,6 @@
         <source>Quit</source>
         <translation>Quit</translation>
     </message>
-    <message>
-        <source>Load subtitles</source>
-        <translation type="vanished">Load subtitles</translation>
-    </message>
-    <message>
-        <source>Play/Pause</source>
-        <translation type="vanished">Play/Pause</translation>
-    </message>
-    <message>
-        <source>Stop</source>
-        <translation type="vanished">Stop</translation>
-    </message>
-    <message>
-        <source>Fullscreen</source>
-        <translation type="vanished">Fullscreen</translation>
-    </message>
-    <message>
-        <source>Playlist</source>
-        <translation type="vanished">Playlist</translation>
-    </message>
 </context>
 <context>
     <name>OpenMenu</name>
@@ -246,163 +222,117 @@
 <context>
     <name>PlayerViewModel</name>
     <message>
-        <source>%1×%2 %3 %4 %5fps · %6f</source>
-        <translation type="vanished">%1×%2 %3 %4 %5fps · %6f</translation>
-    </message>
-    <message>
-        <source>%1×%2 %3fps</source>
-        <translation type="vanished">%1×%2 %3fps</translation>
-    </message>
-    <message>
-        <source>%1×%2 (%3×)</source>
-        <translation type="vanished">%1×%2 (%3×)</translation>
-    </message>
-    <message>
-        <source>%1bit</source>
-        <translation type="vanished">%1bit</translation>
-    </message>
-    <message>
-        <source>%1× %2</source>
-        <translation type="vanished">%1× %2</translation>
-    </message>
-    <message>
-        <source>auto %1</source>
-        <translation type="vanished">auto %1</translation>
-    </message>
-    <message>
-        <source>Denoise %1</source>
-        <translation type="vanished">Denoise %1</translation>
-    </message>
-    <message>
-        <source>off</source>
-        <translation type="vanished">off</translation>
-    </message>
-    <message>
-        <source>%1 %2</source>
-        <translation type="vanished">%1 %2</translation>
-    </message>
-    <message>
-        <source>%1 %2 %3</source>
-        <translation type="vanished">%1 %2 %3</translation>
-    </message>
-    <message>
-        <source>NVDEC</source>
-        <translation type="vanished">NVDEC</translation>
-    </message>
-    <message>
-        <source>Software</source>
-        <translation type="vanished">Software</translation>
-    </message>
-    <message>
-        <source>%1×</source>
-        <translation type="vanished">%1×</translation>
-    </message>
-    <message>
-        <source>%1 / %2</source>
-        <translation type="vanished">%1 / %2</translation>
-    </message>
-    <message>
-        <source>rendered %1  dropped %2</source>
-        <translation type="vanished">rendered %1  dropped %2</translation>
-    </message>
-    <message>
-        <source>%1Hz %2ch</source>
-        <translation type="vanished">%1Hz %2ch</translation>
-    </message>
-    <message>
+        <location filename="../FrucBackend.h" line="71"/>
+        <location filename="../FrucBackend.h" line="90"/>
         <source>Off</source>
-        <translation type="vanished">Off</translation>
+        <translation>Off</translation>
     </message>
     <message>
+        <location filename="../FrucBackend.h" line="72"/>
         <source>×2</source>
-        <translation type="vanished">×2</translation>
+        <translation>×2</translation>
     </message>
     <message>
+        <location filename="../FrucBackend.h" line="73"/>
         <source>×3</source>
-        <translation type="vanished">×3</translation>
+        <translation>×3</translation>
     </message>
     <message>
+        <location filename="../FrucBackend.h" line="74"/>
         <source>×4</source>
-        <translation type="vanished">×4</translation>
+        <translation>×4</translation>
     </message>
     <message>
+        <location filename="../FrucBackend.h" line="91"/>
         <source>40 fps</source>
-        <translation type="vanished">40 fps</translation>
+        <translation>40 fps</translation>
     </message>
     <message>
+        <location filename="../FrucBackend.h" line="92"/>
+        <location filename="../FrucBackend.h" line="254"/>
         <source>48 fps</source>
-        <translation type="vanished">48 fps</translation>
+        <translation>48 fps</translation>
     </message>
     <message>
+        <location filename="../FrucBackend.h" line="93"/>
+        <location filename="../FrucBackend.h" line="255"/>
         <source>60 fps</source>
-        <translation type="vanished">60 fps</translation>
+        <translation>60 fps</translation>
     </message>
     <message>
+        <location filename="../FrucBackend.h" line="118"/>
         <source>Low</source>
-        <translation type="vanished">Low</translation>
+        <translation>Low</translation>
     </message>
     <message>
+        <location filename="../FrucBackend.h" line="119"/>
         <source>Medium</source>
-        <translation type="vanished">Medium</translation>
+        <translation>Medium</translation>
     </message>
     <message>
+        <location filename="../FrucBackend.h" line="120"/>
         <source>High</source>
-        <translation type="vanished">High</translation>
+        <translation>High</translation>
     </message>
     <message>
-        <location filename="../PlayerViewModel.cpp" line="2281"/>
-        <location filename="../PlayerViewModel.cpp" line="2289"/>
+        <location filename="../FrucBackend.h" line="256"/>
+        <source>120 fps</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location filename="../PlayerViewModel.cpp" line="2291"/>
+        <location filename="../PlayerViewModel.cpp" line="2299"/>
         <source>Source</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location filename="../PlayerViewModel.cpp" line="2315"/>
+        <location filename="../PlayerViewModel.cpp" line="2325"/>
         <source>Output</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location filename="../PlayerViewModel.cpp" line="2322"/>
+        <location filename="../PlayerViewModel.cpp" line="2332"/>
         <source>HDR</source>
         <translation>HDR</translation>
     </message>
     <message>
-        <location filename="../PlayerViewModel.cpp" line="2350"/>
+        <location filename="../PlayerViewModel.cpp" line="2360"/>
         <source>VSR</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location filename="../PlayerViewModel.cpp" line="2375"/>
+        <location filename="../PlayerViewModel.cpp" line="2385"/>
         <source>FRUC</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location filename="../PlayerViewModel.cpp" line="2394"/>
-        <location filename="../PlayerViewModel.cpp" line="2399"/>
+        <location filename="../PlayerViewModel.cpp" line="2404"/>
+        <location filename="../PlayerViewModel.cpp" line="2409"/>
         <source>Decoder</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location filename="../PlayerViewModel.cpp" line="2404"/>
+        <location filename="../PlayerViewModel.cpp" line="2414"/>
         <source>Speed</source>
         <translation>Speed</translation>
     </message>
     <message>
-        <location filename="../PlayerViewModel.cpp" line="2406"/>
+        <location filename="../PlayerViewModel.cpp" line="2416"/>
         <source>Time</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location filename="../PlayerViewModel.cpp" line="2410"/>
+        <location filename="../PlayerViewModel.cpp" line="2420"/>
         <source>Frames</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location filename="../PlayerViewModel.cpp" line="2414"/>
+        <location filename="../PlayerViewModel.cpp" line="2424"/>
         <source>GPU</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location filename="../PlayerViewModel.cpp" line="2417"/>
+        <location filename="../PlayerViewModel.cpp" line="2427"/>
         <source>Audio</source>
         <translation>Audio</translation>
     </message>
@@ -512,18 +442,6 @@
         <source>Advanced</source>
         <translation>Advanced</translation>
     </message>
-    <message>
-        <source>30 fps</source>
-        <translation type="vanished">30 fps</translation>
-    </message>
-    <message>
-        <source>40 fps</source>
-        <translation type="vanished">40 fps</translation>
-    </message>
-    <message>
-        <source>60 fps</source>
-        <translation type="vanished">60 fps</translation>
-    </message>
 </context>
 <context>
     <name>SegToggle</name>
@@ -566,14 +484,6 @@
 </context>
 <context>
     <name>TracksPopup</name>
-    <message>
-        <source>Visible</source>
-        <translation type="vanished">Visible</translation>
-    </message>
-    <message>
-        <source>Hidden</source>
-        <translation type="vanished">Hidden</translation>
-    </message>
     <message>
         <location filename="../ui/TracksPopup.qml" line="125"/>
         <source>Track %1</source>

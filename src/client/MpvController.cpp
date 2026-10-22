@@ -342,7 +342,7 @@ void MpvController::setHdrTarget(bool hdr, float minLuma, float maxLuma) {
     }
     MLOG_INFO("mpv HDR target: %s (min=%.3f nit max=%.1f nit; target-trc/prim=%s)",
               hdr ? "HDR10 (PQ/BT.2020)" : "SDR", minLuma, maxLuma,
-              hdr ? "pq/bt.2020（不预 tone map）" : "auto/auto");
+              hdr ? "pq/bt.2020 (no pre tone mapping)" : "auto/auto");
 }
 
 void MpvController::render(VkImage img, VkFormat fmt, int w, int h) {

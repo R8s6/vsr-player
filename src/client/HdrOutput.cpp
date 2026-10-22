@@ -79,7 +79,7 @@ Policy policyFromEnv() {
         return Policy::Off;
     if (v == "hdr10")
         return Policy::ForceHdr10;
-    MLOG_ERR("hdr: VSR_HDR=%s 无法识别（支持 off|auto|hdr10）→ 按 auto 处理",
+    MLOG_ERR("hdr: VSR_HDR=%s not recognized (off|auto|hdr10) -> falling back to auto",
              v.constData());
     return Policy::Auto;
 }
@@ -104,7 +104,7 @@ bool upconvertOptedIn() {
         const QByteArray v = qgetenv("VSR_UPHDR").trimmed().toLower();
         const bool e = (v == "on" || v == "1" || v == "true" || v == "yes");
         if (!v.isEmpty() && !e) {
-            MLOG_ERR("hdr: VSR_UPHDR=%s 无法识别（支持 on|1|true）→ 上变换保持关闭",
+            MLOG_ERR("hdr: VSR_UPHDR=%s not recognized (on|1|true) -> upconversion stays off",
                      v.constData());
         }
         g_upconvertOptIn = e;
@@ -180,13 +180,13 @@ ColorModule &colorModule() {
         m.tried = true;
         const QString path = colorModulePath();
         if (path.isEmpty()) {
-            MLOG_INFO("hdr: 显示能力模块未找到（libvsr-color-feedback.so）→ "
-                      "显示能力不可读（退 SDR）");
+            MLOG_INFO("hdr: display capability module not found (libvsr-color-feedback.so) -> "
+                      "capability unreadable (falling back to SDR)");
             return m;
         }
         m.lib = new QLibrary(path);
         if (!m.lib->load()) {
-            MLOG_INFO("hdr: 显示能力模块加载失败 (%s): %s",
+            MLOG_INFO("hdr: failed to load the display capability module (%s): %s",
                       path.toUtf8().constData(),
                       m.lib->errorString().toUtf8().constData());
             delete m.lib;
@@ -215,10 +215,10 @@ int ensureModule(QQuickWindow *window) {
         const int rc = m.init(window);
         m.initRc = rc;
         if (rc == 0) {
-            MLOG_INFO("hdr: 合成器色彩管理就绪：%s",
+            MLOG_INFO("hdr: compositor color management ready: %s",
                       m.summary ? m.summary() : "(no summary)");
         } else if (rc != -2) {
-            MLOG_INFO("hdr: 显示能力不可用（rc=%d）→ 退 SDR", rc);
+            MLOG_INFO("hdr: display capability unavailable (rc=%d) -> falling back to SDR", rc);
             m.initRc = -1;
         }
     }
@@ -256,11 +256,11 @@ DisplayInfo displayInfoFor(QQuickWindow *window) {
     d.gamutArea = (float)w.gamut_area;
     d.hdr = w.hdr_volume != 0;
     if (d.hdr)
-        d.reason = QStringLiteral("gamut_area=%1（sRGB=0.112）tf=%2 named_prim=%3")
+        d.reason = QStringLiteral("gamut_area=%1 (sRGB=0.112) tf=%2 named_prim=%3")
                        .arg(d.gamutArea, 0, 'f', 4).arg(int(d.tf))
                        .arg(d.havePrimaries ? int(d.primaries) : -1);
     else
-        d.reason = QStringLiteral("gamut_area=%1 tf=%2（sRGB/BT.709 级）")
+        d.reason = QStringLiteral("gamut_area=%1 tf=%2 (sRGB/BT.709 class)")
                        .arg(d.gamutArea, 0, 'f', 4).arg(int(d.tf));
 
     // 亮度换算对齐 mpv（wayland_common.c info_done）：合成器亮度以 ref_lum 为
@@ -315,7 +315,7 @@ void noteActualSwapchain(Mode m) {
         return;
     st.actualSwapchain = m;
     st.haveActual = true;
-    MLOG_INFO("hdr output: 实际输出 = %s", modeName(m));
+    MLOG_INFO("hdr output: actual output = %s", modeName(m));
 }
 
 /// 上变换的**自动**目标峰值：面板物理峰值（合成器 preferred 的 maxLuma，与 OSD
@@ -333,12 +333,12 @@ static float upconvertDebugNits() {
         bool ok = false;
         const float n = v.toFloat(&ok);
         if (!ok || n < 400.0f || n > 2000.0f) {
-            MLOG_ERR("hdr: VSR_UPHDR_NITS=%s 非法（SDK 只接受 400–2000 nit）"
-                     "→ 忽略，按面板峰值", v.constData());
+            MLOG_ERR("hdr: VSR_UPHDR_NITS=%s invalid (SDK only accepts 400-2000 nit) "
+                     "-> ignored, using the panel peak", v.constData());
             return 0.0f;
         }
-        MLOG_INFO("hdr upconvert: 目标峰值被 VSR_UPHDR_NITS 覆盖为 %.0f nit"
-                  "（调试用；正常路径 = 面板物理峰值）", n);
+        MLOG_INFO("hdr upconvert: target peak overridden by VSR_UPHDR_NITS to %.0f nit "
+                  "(debug only; normal path = panel physical peak)", n);
         return n;
     }();
     return envOverride;
@@ -403,14 +403,14 @@ uint64_t g_lastNotifiedGen = 0;
 void logDisplayInfo(QQuickWindow *window, const char *when) {
     const DisplayInfo d = displayInfoFor(window);
     if (!d.valid) {
-        MLOG_INFO("hdr display[%s]: screen=%s 合成器显示能力不可读（模块缺失/无 "
-                  "wp_color_management_v1/还没拿到 preferred 描述）→ 退 SDR",
+        MLOG_INFO("hdr display[%s]: screen=%s compositor display capability unreadable "
+                  "(module missing / no wp_color_management_v1 / preferred description not yet received) -> SDR",
                   when, d.screen.toUtf8().constData());
         return;
     }
     MLOG_INFO("hdr display[%s]: screen=%s gamut_area=%.4f primaries=%d tf=%d "
-              "luminances{min=%.4f max=%.1f ref=%.1f}%s → %s（%s）"
-              " mpv口径 peak=%.1f nit min=%.2f nit",
+              "luminances{min=%.4f max=%.1f ref=%.1f}%s -> %s (%s)"
+              " mpv-facing peak=%.1f nit min=%.2f nit",
               when, d.screen.toUtf8().constData(), d.gamutArea,
               d.havePrimaries ? int(d.primaries) : -1,
               d.haveTf ? int(d.tf) : -1,
@@ -460,7 +460,7 @@ void syncTargets(Mode mode) {
         if (qgetenv("VSR_HDR_DECLARE") != "0") {
             const int rc = declareHdr10Surface(st.window);
             if (rc != 0)
-                MLOG_WARN("hdr: HDR10 描述下发失败（rc=%d）", rc);
+                MLOG_WARN("hdr: failed to send the HDR10 description (rc=%d)", rc);
         }
     }
 }
@@ -507,7 +507,7 @@ bool applyMode(QQuickWindow *window, Mode mode, QString *err) {
         return true;
 
     QRhiSwapChain *sc = window->swapChain();
-    if (!sc) return fail("swapchain 未就绪（场景图还没建）");
+    if (!sc) return fail("swapchain not ready (scene graph not built yet)");
 
     const QRhiSwapChain::Format want = rhiFormatForMode(mode);
     const Mode cur = modeForRhiFormat(sc->format());
@@ -537,31 +537,31 @@ bool applyMode(QQuickWindow *window, Mode mode, QString *err) {
     // ⚠ 教训：**平均亮度不能当正确性判据** —— 当时测得"不声明 19.6 vs 声明 13.1，
     //    mpv 20.7"，据此选错；发灰正是"更亮"的观感来源。必须目检（或比饱和度/对比度）。
     static const bool declareEnabled = qgetenv("VSR_HDR_DECLARE") != "0";    if (mode == Mode::Hdr10 && !declareEnabled) {
-        MLOG_INFO("hdr applyMode: 不下发自定义色彩描述（VSR_HDR_DECLARE=0，"
-                  "对齐 mpv hint 路径；本机实测画面发灰，仅作对照）");
+        MLOG_INFO("hdr applyMode: not sending a custom color description (VSR_HDR_DECLARE=0, "
+                  "matching mpv's hint path; looks washed out on this machine, comparison only)");
         unsetSurfaceDescription(window);
         if (err) err->clear();
     } else if (mode == Mode::Hdr10) {
         const int drc = declareHdr10Surface(window);
         if (drc != 0)
-            MLOG_WARN("hdr applyMode: PQ 声明失败（rc=%d）——合成器可能按默认/首选"
-                      "解释本窗口（可能偏暗）", drc);
+            MLOG_WARN("hdr applyMode: PQ declaration failed (rc=%d) -- the compositor may "
+                      "interpret this window with its default/preferred description (possibly darker)", drc);
     } else {
         const int urc = unsetSurfaceDescription(window);
         if (urc != 0)
-            MLOG_WARN("hdr applyMode: 撤下色彩描述失败（rc=%d）", urc);
+            MLOG_WARN("hdr applyMode: failed to remove the color description (rc=%d)", urc);
     }
 
     // ③ swapchain 格式（需要重建）
     if (cur != mode) {
         if (!sc->isFormatSupported(want))
-            return fail("合成器/display 不支持该 swapchain 格式");
+            return fail("compositor/display does not support this swapchain format");
         sc->setFormat(want);
         QRhiRenderPassDescriptor *rp = sc->newCompatibleRenderPassDescriptor();
-        if (!rp) return fail("newCompatibleRenderPassDescriptor 失败");
+        if (!rp) return fail("newCompatibleRenderPassDescriptor failed");
         sc->setRenderPassDescriptor(rp);
-        if (!sc->createOrResize()) return fail("swapchain createOrResize 失败");
-        MLOG_INFO("hdr applyMode: swapchain %s → %s（已重建，含 render pass）",
+        if (!sc->createOrResize()) return fail("swapchain createOrResize failed");
+        MLOG_INFO("hdr applyMode: swapchain %s -> %s (recreated, including render pass)",
                   modeName(cur), modeName(mode));
     }
     return true;
@@ -578,15 +578,15 @@ void reevaluate(const char *why) {
     switch (st.policy) {
     case Policy::ForceHdr10:
         want = Mode::Hdr10;
-        reason = QStringLiteral("策略 hdr10（强制）");
+        reason = QStringLiteral("policy hdr10 (forced)");
         st.shortReason = QStringLiteral("forced");
         break;
     case Policy::Auto:
         if (!st.display.valid) {
-            reason = QStringLiteral("显示能力未知（preferred 未到）→ 退 SDR");
+            reason = QStringLiteral("display capability unknown (preferred not received yet) -> SDR");
             st.shortReason = QStringLiteral("display unknown");
         } else if (!st.display.hdr) {
-            reason = QStringLiteral("合成器 preferred 非宽色域（SDR 屏或 WCG-only）"
+            reason = QStringLiteral("compositor preferred is not wide-gamut (SDR display or WCG-only)"
                                     " gamut_area=%1").arg(st.display.gamutArea, 0, 'f', 4);
             st.shortReason = QStringLiteral("display SDR/WCG-only");
         } else if (!st.contentHdr && upconvertOptedIn() && st.upconvertInChain) {
@@ -595,17 +595,17 @@ void reevaluate(const char *why) {
             // ⚠ 只在这里（面板是 HDR 时）才切输出；面板 SDR 时输出保持 SDR，
             //   上变换仍会跑（见下面 up_want）——"面板非 HDR 也允许开启"。
             want = Mode::Hdr10;
-            reason = QStringLiteral("SDR 内容上变换（VSR_UPHDR opt-in）× 显示 HDR"
-                                    "（gamut_area=%1，peak=%2 nit）")
+            reason = QStringLiteral("SDR content upconversion (VSR_UPHDR opt-in) x HDR display"
+                                    " (gamut_area=%1, peak=%2 nit)")
                          .arg(st.display.gamutArea, 0, 'f', 4)
                          .arg(st.display.peakNits, 0, 'f', 1);
             st.shortReason = QStringLiteral("SDR upconvert x display HDR");
         } else if (!st.contentHdr) {
-            reason = QStringLiteral("内容非 HDR（video-params/gamma 非 pq/hlg）");
+            reason = QStringLiteral("content is not HDR (video-params/gamma is neither pq nor hlg)");
             st.shortReason = QStringLiteral("content SDR");
         } else {
             want = Mode::Hdr10;
-            reason = QStringLiteral("内容 HDR × 显示 HDR（gamut_area=%1，peak=%2 nit）")
+            reason = QStringLiteral("HDR content x HDR display (gamut_area=%1, peak=%2 nit)")
                          .arg(st.display.gamutArea, 0, 'f', 4)
                          .arg(st.display.peakNits, 0, 'f', 1);
             st.shortReason = QStringLiteral("content HDR x display HDR");
@@ -613,7 +613,7 @@ void reevaluate(const char *why) {
         break;
     case Policy::Off:
     default:
-        reason = QStringLiteral("策略 off");
+        reason = QStringLiteral("policy off");
         st.shortReason = QStringLiteral("policy off");
         break;
     }
@@ -631,10 +631,10 @@ void reevaluate(const char *why) {
     const float up_auto = upconvertLuminance(st.display);
     const float up_nits = upconvertEffectiveLuminance(st.display);
     if (up_want != st.upconvert || fabsf(up_nits - st.upconvertNits) >= 0.5f)
-        MLOG_INFO("hdr upconvert: %s（输出 %s；面板峰值 %.0f nit，生效峰值 %.0f nit%s；"
-                  "策略=%s 内容=%s opt-in=%d）",
+        MLOG_INFO("hdr upconvert: %s (output %s; panel peak %.0f nit, effective peak %.0f nit%s; "
+                  "policy=%s content=%s opt-in=%d)",
                   up_want ? "on" : "off", modeName(want), up_auto, up_nits,
-                  g_lumOverride ? " = 用户覆盖" : "",
+                  g_lumOverride ? " = user override" : "",
                   st.policy == Policy::Auto ? "auto"
                                             : st.policy == Policy::Off ? "off" : "hdr10",
                   st.contentHdr ? "HDR" : "SDR", int(upconvertOptedIn()));
@@ -653,7 +653,7 @@ void reevaluate(const char *why) {
 
     QString err;
     if (!applyMode(st.window, want, &err)) {
-        MLOG_ERR("hdr policy[%s]: 目标 %s 应用失败（%s）→ 保持 %s",
+        MLOG_ERR("hdr policy[%s]: applying target %s failed (%s) -> keeping %s",
                  why, modeName(want), err.toUtf8().constData(), modeName(st.applied));
         return;
     }
@@ -662,7 +662,7 @@ void reevaluate(const char *why) {
     // 实际 swapchain 格式 = 刚应用成功的这个（`applyMode` 里 setFormat +
     // createOrResize 成功；`cur == mode` 时是从 sc->format() 反查出来的）。
     noteActualSwapchain(want);
-    MLOG_INFO("hdr policy[%s]: → %s（%s）", why, modeName(want),
+    MLOG_INFO("hdr policy[%s]: -> %s (%s)", why, modeName(want),
               reason.toUtf8().constData());
     if (st.hooks.rebuildRenderPath)
         st.hooks.rebuildRenderPath(want);
@@ -684,8 +684,8 @@ void installPolicy(QQuickWindow *window, Policy policy, Mode initialMode, ApplyH
     st.applied = initialMode;
     st.haveApplied = true;   // 启动模式已经生效（show 前设的），无需重复应用
     st.hooks = std::move(hooks);
-    MLOG_INFO("hdr: 策略=%s（auto = 内容 HDR × 显示能力 HDR；off/hdr10 见文档）"
-              "；SDR→HDR10 上变换 opt-in=%d（VSR_UPHDR，默认关）",
+    MLOG_INFO("hdr: policy=%s (auto = HDR content x HDR display capability; see docs for off/hdr10); "
+              "SDR->HDR10 upconversion opt-in=%d (VSR_UPHDR, off by default)",
               policy == Policy::Auto ? "auto" : policy == Policy::Off ? "off" : "hdr10",
               int(upconvertOptedIn()));
     reevaluate("install");
@@ -696,7 +696,7 @@ void setUpconvertOptIn(bool on) {
     if (cur == on)
         return;
     g_upconvertOptIn = on;
-    MLOG_INFO("hdr upconvert: 用户开关 → %s（重算目标模式）", on ? "on" : "off");
+    MLOG_INFO("hdr upconvert: user switch -> %s (recomputing target mode)", on ? "on" : "off");
     reevaluate("upconvert opt-in");
 }
 
@@ -705,7 +705,8 @@ void setUpconvertInChain(bool in) {
     if (st.upconvertInChain == in)
         return;
     st.upconvertInChain = in;
-    MLOG_INFO("hdr upconvert: vf 链上%s truehdr 滤镜（重算）", in ? "有" : "**没有**");
+    MLOG_INFO("hdr upconvert: truehdr filter %s on the vf chain (recomputing)",
+              in ? "present" : "**absent**");
     reevaluate("upconvert chain");
 }
 
@@ -715,8 +716,8 @@ void setUpconvertLuminanceOverride(bool on, int nits) {
         return;
     g_lumOverride = on;
     g_lumOverrideNits = n;
-    MLOG_INFO("hdr upconvert: 目标峰值 → %s（%d nit）",
-              on ? "用户覆盖" : "自动（面板物理峰值）", on ? n : 0);
+    MLOG_INFO("hdr upconvert: target peak -> %s (%d nit)",
+              on ? "user override" : "auto (panel physical peak)", on ? n : 0);
     // 声明里的内容峰值必须跟着变（effectiveContentMeta）→ 重算 + 重下发
     reevaluate("upconvert luminance");
 }
@@ -739,11 +740,11 @@ void setContentMeta(const ContentMeta &meta) {
     st.contentMeta = meta;
 
     if (!meta.valid) {
-        MLOG_INFO("hdr content-meta: 无静态元数据 → 合成器按主色体积上限"
-                  "（PQ 名义 10000nit）做 tone mapping");
+        MLOG_INFO("hdr content-meta: no static metadata -> the compositor tone-maps against "
+                  "the primary-volume ceiling (nominal 10000 nit for PQ)");
     } else {
         MLOG_INFO("hdr content-meta: mastering %.4f-%.0f nit, max_cll=%.0f, "
-                  "max_fall=%.0f → 作为 HDR10 描述的内容峰值下发",
+                  "max_fall=%.0f -> sent as the HDR10 description's content peak",
                   meta.minMastering, meta.maxMastering, meta.maxCll, meta.maxFall);
     }
 
@@ -760,7 +761,7 @@ void setContentMeta(const ContentMeta &meta) {
         return;
     const int rc = declareHdr10Surface(st.window);
     if (rc != 0)
-        MLOG_WARN("hdr content-meta: 重新声明描述失败（rc=%d）", rc);
+        MLOG_WARN("hdr content-meta: failed to re-send the description (rc=%d)", rc);
 }
 
 Mode targetMode() { return policyState().applied; }
@@ -847,7 +848,7 @@ namespace {
 
 void logCapabilities(const Capabilities &c, const char *when) {
     if (!c.probed) {
-        MLOG_INFO("hdr probe[%s]: swapchain 未就绪（backend=%s screen=%s）——稍后重试",
+        MLOG_INFO("hdr probe[%s]: swapchain not ready (backend=%s screen=%s) -- retrying later",
                   when, c.backend.toUtf8().constData(), c.screen.toUtf8().constData());
         return;
     }
@@ -901,8 +902,8 @@ void installCapabilityProbe(QQuickWindow *window) {
         if (QRhiSwapChain *sc = window->swapChain()) {
             const QRhiSwapChainHdrInfo hi = sc->hdrInfo();
             if (hi.limitsType == QRhiSwapChainHdrInfo::LuminanceInNits)
-                MLOG_INFO("hdr probe: Qt hdrInfo (Linux 恒为硬编码默认值，不可作为"
-                          "选屏依据) limits=nits min=%.2f max=%.2f sdrWhite=%.2f "
+                MLOG_INFO("hdr probe: Qt hdrInfo (on Linux this is a hardcoded default, "
+                          "not usable for display selection) limits=nits min=%.2f max=%.2f sdrWhite=%.2f "
                           "behavior=%s",
                           hi.limits.luminanceInNits.minLuminance,
                           hi.limits.luminanceInNits.maxLuminance,
@@ -949,13 +950,13 @@ void installSwapchainVerification(QQuickWindow *window, Mode expected) {
         if (policyState().hooks.statusChanged)
             policyState().hooks.statusChanged();
         if (c.current == expected) {
-            MLOG_INFO("hdr verify: swapchain=%s == 期望 %s ✔（screen=%s）",
+            MLOG_INFO("hdr verify: swapchain=%s == expected %s (screen=%s)",
                       modeName(c.current), modeName(expected),
                       c.screen.toUtf8().constData());
         } else {
-            MLOG_ERR("hdr verify: swapchain=%s ≠ 期望 %s（Qt 回退了："
-                     "isFormatSupported{HDR10=%d scRGB=%d P3=%d} backend=%s screen=%s）"
-                     "—— 强制模式不回退，继续按期望格式渲染，画面可能错乱",
+            MLOG_ERR("hdr verify: swapchain=%s != expected %s (Qt fell back: "
+                     "isFormatSupported{HDR10=%d scRGB=%d P3=%d} backend=%s screen=%s) "
+                     "-- forced mode does not fall back; rendering continues with the expected format, picture may be garbled",
                      modeName(c.current), modeName(expected),
                      c.hdr10, c.scrgb, c.p3, c.backend.toUtf8().constData(),
                      c.screen.toUtf8().constData());

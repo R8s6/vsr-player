@@ -51,10 +51,10 @@ bool VulkanContext::init() {
     if (instance_extension_available(kSwapchainColorSpaceExt)) {
         instExts.push_back(kSwapchainColorSpaceExt);
         swapchainColorspaceExt_ = true;
-        MLOG_INFO("instance ext %s enabled (HDR swapchain 色彩空间可枚举)",
+        MLOG_INFO("instance ext %s enabled (HDR swapchain color spaces enumerable)",
                   kSwapchainColorSpaceExt);
     } else {
-        MLOG_INFO("instance ext %s NOT available → HDR 上屏不可用（保持 SDR）",
+        MLOG_INFO("instance ext %s NOT available -> HDR output disabled (staying SDR)",
                   kSwapchainColorSpaceExt);
     }
 

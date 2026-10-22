@@ -153,7 +153,7 @@ bool vfx_load_libraries(void) {
              strcmp(libs[i], "libnvVFXTrueHDR.so") == 0 ||
              strcmp(libs[i], "libnvidia-ngx-truehdr.so") == 0) &&
             access(path, R_OK) != 0) {
-            fprintf(stderr, "VSR: %s 不可用（此 VFX SDK 无 %s）\n",
+            fprintf(stderr, "VSR: %s unavailable (this VFX SDK has no %s)\n",
                     strcmp(libs[i], "libnvVFXVideoFrameGeneration.so") == 0
                         ? "VFG" : "TrueHDR", libs[i]);
             continue;

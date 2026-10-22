@@ -57,17 +57,17 @@ CudaProbeResult cuda_probe_for_vulkan_uuid(const uint8_t uuid[16]) {
     CudaProbeResult r;
     CudaApi api;
     if (!api.load()) {
-        r.detail = "libcuda 不可加载（无 NVIDIA 驱动？）";
+        r.detail = "libcuda not loadable (no NVIDIA driver?)";
         return r;
     }
     CUresult cu = api.cuInit(0);
     if (cu != kCudaSuccess) {
-        r.detail = "cuInit 失败（" + std::to_string(cu) + "）";
+        r.detail = "cuInit failed (" + std::to_string(cu) + ")";
         return r;
     }
     int n = 0;
     if (api.cuDeviceGetCount(&n) != kCudaSuccess || n <= 0) {
-        r.detail = "CUDA 可见设备数为 0（CUDA_VISIBLE_DEVICES？）";
+        r.detail = "CUDA reports 0 visible devices (CUDA_VISIBLE_DEVICES?)";
         return r;
     }
     r.deviceCount = n;
@@ -98,8 +98,8 @@ CudaProbeResult cuda_probe_for_vulkan_uuid(const uint8_t uuid[16]) {
         if (i) list += ", ";
         list += names[i];
     }
-    r.detail = "CUDA 可见 " + std::to_string(r.deviceCount) + " 张：" + list;
+    r.detail = "CUDA sees " + std::to_string(r.deviceCount) + " device(s): " + list;
     if (!r.matched)
-        r.detail += "（Vulkan 设备 uuid=" + hex_uuid(uuid) + " 不在其中）";
+        r.detail += " (Vulkan device uuid=" + hex_uuid(uuid) + " is not among them)";
     return r;
 }

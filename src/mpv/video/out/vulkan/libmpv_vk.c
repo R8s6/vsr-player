@@ -106,8 +106,9 @@ static bool vk_start_frame(struct ra_swapchain *sw, struct ra_fbo *out_fbo)
         p->logged_format = p->cur_format;
         p->logged_hdr    = p->cur_hdr;
         MP_INFO(sw->ctx, "libmpv_vk: render target fmt=%d hdr=%d "
-                "color_depth=%d csp=%s（合成器亮度 min=%.2f max=%.2f nit，仅诊断；"
-                "故意不填进 csp —— 否则会本地预 tone map 到 203nit 变暗）\n",
+                "color_depth=%d csp=%s (compositor luminance min=%.2f max=%.2f nit, "
+                "diagnostic only; deliberately not put into csp -- it would pre-tone-map "
+                "to 203 nit locally and darken the picture)\n",
                 (int)p->cur_format, p->cur_hdr, vk_color_depth(sw),
                 p->cur_hdr ? "PQ/BT.2020" : "unspecified",
                 p->cur_min_luma, p->cur_max_luma);
