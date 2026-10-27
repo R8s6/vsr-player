@@ -1,10 +1,13 @@
 #pragma once
 #include <QQuickItem>
+#include <QSize>
+#include "CompositeParams.h"
 #include <vulkan/vulkan.h>
 #include <atomic>
 #include <functional>
 
 class MpvController;
+class StereoController;
 
 /// Single-threaded video renderer.
 /// mpv work (update→render→reportSwap) happens in updatePaintNode on the main thread.
@@ -20,6 +23,17 @@ public:
     ~Video() override;
 
     void setMpvController(MpvController *mpv);
+    /// 3D 输出：合成片元着色器从该 controller 取布局/眼序/缩放。
+    void setStereoController(StereoController *s) { stereo_ = s; }
+    /// 源视频整帧比例（W/H），由 main.cpp 接 viewModel 的 videoWidth/Height。
+    void setSourceAspectProvider(std::function<double()> fn) { srcAspectFn_ = std::move(fn); }
+    void setSourceSizeProvider(std::function<QSize()> fn) { srcSizeFn_ = std::move(fn); }
+    StereoCompositeParams stereoParams(int outW, int outH) const;
+    /// 合成输出宽度：向上取偶。Wayland 分数缩放会让 framebuffer 宽成为
+    /// 奇数（本机 2844×1.35 = 3839），奇数宽无法被左右眼均分（1919.5），
+    /// 两眼映射会差半个像素 → 整幅画面恒定水平视差。渲染目标/合成视口都
+    /// 按这个宽度分配：多出的 1 列落在窗口外被裁掉（右眼最外侧一列）。
+    static int compositeWidth(int w) { return w > 0 ? w + (w & 1) : w; }
     bool initRenderTarget(VkDevice dev, VkPhysicalDevice pd, uint32_t qfi, VkQueue queue);
     void setCompositeObjects(VkPipeline pipe, VkPipelineLayout layout);
     /// 合成节点在**渲染阶段**读这两个 getter（而不是缓存句柄）：运行期
@@ -57,6 +71,12 @@ public:
     /// render to consume pending VO work; see vo_libmpv flip_page).
     std::atomic<bool> renderRequested_{false};
 
+    /// 没有可显示的画面（播放列表被清空）：合成阶段直接输出纯黑。
+    /// 不能指望 mpv 清掉 rtImage —— 渲染循环是"有新帧才画"，清空后没有
+    /// 新帧，rtImage 里留着最后一帧（用户实测："列表清空了，画面还停在
+    /// 最后播放状态"）。
+    std::atomic<bool> blank_{false};
+
     /// Benchmark counters (updated on the render/main thread, read by the
     /// event thread on END_FILE — hence atomic).
     std::atomic<int> benchFrames_{0};
@@ -67,6 +87,8 @@ public:
 
 public slots:
     void kickstart();
+    /// 标记"无画面"：true 时合成输出纯黑（播放列表清空），有新文件载入时复位。
+    void setBlank(bool on);
     /// mpv update callback（核心线程）invokeMethod(QueuedConnection) 驱动
     /// 的渲染请求（社区标准模式，见 trin94/qtquick-mpv）。GUI 线程执行：
     /// 条件检查（need_render）→ update() + postEvent 投递渲染请求。
@@ -77,6 +99,13 @@ protected:
 
 private:
     MpvController   *mpv_ = nullptr;
+    StereoController *stereo_ = nullptr;
+    std::function<double()> srcAspectFn_;
+    std::function<QSize()> srcSizeFn_;
+    /// 诊断：3D 映射参数变化时打一行 INFO（用户报“不满屏/两眼错位”时
+    /// 直接看这行的 out/src/全半/每眼实际像素尺寸，不用猜）。
+    mutable StereoCompositeParams loggedMap_{};
+    mutable bool loggedMapValid_ = false;
     VkDevice         dev_ = VK_NULL_HANDLE;
     VkPhysicalDevice pd_ = VK_NULL_HANDLE;
     VkQueue          queue_ = VK_NULL_HANDLE;

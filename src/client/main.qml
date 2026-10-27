@@ -10,17 +10,59 @@ Item {
     anchors.fill: parent
 
     // ── 渲染层（z 最低）────────────────────────────────────────────
-    Video {
-        id: video
+    // controlMode = 桌面 UI 窗口：不创建 Video（视频只在 presentation 主窗口）。
+    Loader {
+        id: videoLoader
         anchors.fill: parent
+        active: !controlMode
+        sourceComponent: Component {
+            Video {
+                id: video
+                anchors.fill: parent
+            }
+        }
     }
 
     // ── UI 层（benchmark 模式隐藏）────────────────────────────────
     Item {
         id: uiLayer   // 信号处理器作用域不含父对象——弹窗互斥须经 uiLayer 显式调用
+        // presentation 主窗口在 3D 时只留 Video + OSD；桌面 control 窗口
+        // 载入同一份 UI，主 UI 始终在桌面可用。
         anchors.fill: parent
-        visible: !benchmarkMode
+        visible: !benchmarkMode && (controlMode || !stereo.active)
         enabled: !benchmarkMode
+
+        // 2D→3D 占位提示（本期不启动 3D 输出）。
+        Rectangle {
+            id: stereoToast
+            z: 1000
+            anchors.horizontalCenter: parent.horizontalCenter
+            anchors.bottom: parent.bottom
+            anchors.bottomMargin: 96
+            width: toastText.implicitWidth + 32
+            height: 38
+            radius: 6
+            color: "#dd202020"
+            border.width: 1; border.color: "#33ffffff"
+            opacity: 0
+            visible: opacity > 0
+            Behavior on opacity { NumberAnimation { duration: 150 } }
+            Text {
+                id: toastText
+                anchors.centerIn: parent
+                color: "#e0e0e0"; font.pixelSize: 14
+            }
+            Timer {
+                id: toastTimer
+                interval: 2000
+                onTriggered: stereoToast.opacity = 0
+            }
+            function show(msg) {
+                toastText.text = msg
+                opacity = 1
+                toastTimer.restart()
+            }
+        }
 
         // ── Auto-hide ───────────────────────────────────────────────
         // 显示 = 底部区域 hover（bottomBar.mouseInRegion：热区+进度条+
@@ -56,6 +98,8 @@ Item {
         MouseArea {
             anchors.fill: parent
             acceptedButtons: Qt.RightButton
+            // 3D presentation（主窗口在眼镜屏）不响应右键；此时 UI 在 control 窗口。
+            enabled: controlMode || !stereo.active
             onClicked: {
                 if (mouse.button === Qt.RightButton) {
                     uiLayer.closeOtherPopups(contextMenu)
@@ -235,6 +279,8 @@ Item {
         // ── Context Menu（右键，showAt 定位 = 鼠标位置）──────────────
         ContextMenu {
             id: contextMenu
+            // 仅主 UI 窗口可用；presentation 窗口不挂 context menu。
+            enabled: controlMode || !stereo.active
             onOpenFilesRequested: function() { fileDialog.mode = 0; fileDialog.open() }
             onOpenFolderRequested: function() { folderDialog.mode = 0; folderDialog.open() }
             onOpenUrlRequested: urlPopup.open()
@@ -244,18 +290,122 @@ Item {
             onDeleteFileRequested: viewModel.deleteCurrentFile()
             onDeinterlaceSelected: function(mode) { viewModel.setDeintMode(mode) }
             onRotateSelected: function(mode) { viewModel.setRotMode(mode) }
+            onStereoSelected: function(mode, group) {
+                // group 0 = 输出方式（0 关闭 / 1 眼镜 3D / 2 单眼 2D）
+                // group 1 = 片源格式（0 左右·全 / 1 左右·半 / 2 上下·全 / 3 上下·半）
+                // group 2 = 输出选项（单眼：0 左 / 1 右；眼镜：0 正常 / 1 交换眼序）
+                if (group === 1) {
+                    const tab = mode >= 2
+                    const half = (mode & 1) !== 0
+                    stereo.setLayout(tab ? 1 : 0)
+                    stereo.setHalf(half)
+                    viewModel.setStereoMap(stereo.active, stereo.layout, stereo.half ? 1 : 0)
+                    viewModel.setEyeState(viewModel.eyeMode, stereo.layout, stereo.half ? 1 : 0)
+                    return
+                }
+                if (group === 2) {
+                    // 输出选项 = 只看"单眼输出用哪只眼"这一个独立状态
+                    viewModel.setEyePref(mode)
+                    return
+                }
+                // group 0：三种输出方式互斥
+                // ContextMenu 是 Popup.Item，内容挂在窗口 overlay 上；打开另一个
+                // Popup 不会自动关它（Qt 文档/源码无此语义），必须先显式关闭，
+                // 否则它会留在选择器下面，随后跟着主窗口一起移到眼镜屏。
+                contextMenu.close()
+                if (mode === 0) {
+                    stereo.stop()
+                    viewModel.setEyeState(0, stereo.layout, stereo.half ? 1 : 0)
+                } else if (mode === 1) {
+                    // 进 3D 前先关单眼（互斥），再开选择器。
+                    viewModel.setEyeState(0, stereo.layout, stereo.half ? 1 : 0)
+                    // 等当前 popup 的 close 处理完再开选择器，避免两个 popup
+                    // 同帧叠放/抢 grab。
+                    Qt.callLater(function() { stereoPicker.openForMode(1) })
+                } else {
+                    // 单眼 2D：不进 3D 独占模式、不动眼镜屏，只让滤镜链裁成
+                    // "输出选项"里选的那只眼。
+                    stereo.stop()
+                    viewModel.setStereoMap(false, 0, 0)
+                    viewModel.setEyeState(viewModel.eyePref === 1 ? 2 : 1,
+                                          stereo.layout, stereo.half ? 1 : 0)
+                }
+            }
             onQuitRequested: Qt.quit()   // 走标准退出路径（watch-later 落盘）
         }
 
+        // 片源格式自动判定（宽/高 ≥2.6 → 左右·全；≤0.8 → 上下·全；其它不猜）。
+        // 只改"片源格式"，不动 3D/单眼模式。判定是**粘性属性**（可能在 QML
+        // 就绪前就发生），所以变化时应用 + 组件完成时补一次。
+        Connections {
+            target: viewModel
+            function onSourceLayoutHintChanged() { applySourceHint() }
+            Component.onCompleted: applySourceHint()
+            function applySourceHint() {
+                const hint = viewModel.sourceLayoutHint
+                if (hint < 0)
+                    return
+                stereo.setLayout(hint)
+                stereo.setHalf(false)
+                viewModel.setStereoMap(stereo.active, stereo.layout, 0)
+                viewModel.setEyeState(viewModel.eyeMode, stereo.layout, 0)
+            }
+        }
+
+        StereoPicker { id: stereoPicker }
+
         // ── Fullscreen 双向同步 + 键盘（快捷键单点）─────────────────
         Connections { target: window
+            enabled: !controlMode
             function onVisibilityChanged() { viewModel.fullscreen = (window.visibility === Window.FullScreen) } }
         Connections { target: viewModel
+            enabled: !controlMode
             function onFullscreenChanged() {
                 var wantFs = viewModel.fullscreen
                 var isFs = (window.visibility === Window.FullScreen)
                 if (wantFs !== isFs) window.visibility = wantFs ? Window.FullScreen : Window.Windowed
             } }
+
+        // 3D 启动时主窗口会移到眼镜屏；Popup.Item 没有独立窗口，会跟着窗口
+        // 一起过去。这里在主窗口移动前把主窗口里的 popup 全部关掉（不是靠
+        // uiLayer.visible，overlay 里的 popup 不受它影响）。
+        Connections {
+            target: stereo
+            function onActiveChanged() {
+                if (stereo.active) {
+                    uiLayer.closeOtherPopups(null)
+                    playlistPanel.close()
+                    stereoPicker.close()
+                }
+            }
+        }
+
+        // 及时关闭：窗口失活/隐藏、UI 层隐藏（自动隐藏或进入 3D）时，
+        // Popup.Item 不会收到“窗口外”的点击，必须显式关。
+        Connections {
+            target: uiLayer
+            function onVisibleChanged() {
+                if (!uiLayer.visible) {
+                    contextMenu.close()
+                    stereoPicker.close()
+                }
+            }
+        }
+        Connections {
+            target: window
+            function onActiveChanged() {
+                if (!window.active) {
+                    contextMenu.close()
+                    stereoPicker.close()
+                }
+            }
+            function onVisibleChanged() {
+                if (!window.visible) {
+                    contextMenu.close()
+                    stereoPicker.close()
+                }
+            }
+        }
 
         focus: true
 
@@ -273,7 +423,9 @@ Item {
         readonly property bool shortcutsEnabled: !uiLayer.anyPopupOpen
 
         Shortcut {
-            enabled: root.shortcutsEnabled; sequence: "Escape"
+            // 3D presentation 期间不响应 Esc（主窗口可能仍被合成器聚焦，
+            // Esc 退全屏会把窗口切回焦点屏）；退出用桌面 3D → Off。
+            enabled: root.shortcutsEnabled && !stereo.active; sequence: "Escape"
             onActivated: {
                 // 全屏 → 退全屏；播放列表打开 → 关闭；其余不响应。Esc 不控制播放停止。
                 if (viewModel.fullscreen) viewModel.toggleFullscreen()
@@ -281,7 +433,7 @@ Item {
             }
         }
         Shortcut {
-            enabled: root.shortcutsEnabled; sequence: "Space"
+            enabled: root.shortcutsEnabled && !stereo.active; sequence: "Space"
             onActivated: viewModel.togglePlayPause()
         }
         // 当前条目操作：Delete = 仅从列表移除；Shift+Delete = 连同文件移入回收站
@@ -295,28 +447,28 @@ Item {
             onActivated: viewModel.deleteCurrentFile()
         }
         Shortcut {
-            enabled: root.shortcutsEnabled; sequence: "Left"
+            enabled: root.shortcutsEnabled && !stereo.active; sequence: "Left"
             onActivated: viewModel.seekRelative(-5000)
         }
         Shortcut {
-            enabled: root.shortcutsEnabled; sequence: "Shift+Left"
+            enabled: root.shortcutsEnabled && !stereo.active; sequence: "Shift+Left"
             onActivated: viewModel.seekRelative(-10000)
         }
         Shortcut {
-            enabled: root.shortcutsEnabled; sequence: "Right"
+            enabled: root.shortcutsEnabled && !stereo.active; sequence: "Right"
             onActivated: viewModel.seekRelative(5000)
         }
         Shortcut {
-            enabled: root.shortcutsEnabled; sequence: "Shift+Right"
+            enabled: root.shortcutsEnabled && !stereo.active; sequence: "Shift+Right"
             onActivated: viewModel.seekRelative(10000)
         }
         Shortcut {
-            enabled: root.shortcutsEnabled; sequence: "Up"
-            onActivated: viewModel.setVolume(viewModel.volume + 0.05)
+            enabled: root.shortcutsEnabled && !stereo.active; sequence: "Up"
+            onActivated: viewModel.nudgeVolume(0.05)
         }
         Shortcut {
-            enabled: root.shortcutsEnabled; sequence: "Down"
-            onActivated: viewModel.setVolume(viewModel.volume - 0.05)
+            enabled: root.shortcutsEnabled && !stereo.active; sequence: "Down"
+            onActivated: viewModel.nudgeVolume(-0.05)
         }
         Shortcut {
             enabled: root.shortcutsEnabled; sequence: "S"
@@ -332,21 +484,30 @@ Item {
             onActivated: viewModel.frameStep(-1)
         }
         Shortcut {
-            enabled: root.shortcutsEnabled; sequence: "Tab"
+            enabled: root.shortcutsEnabled; sequence: "h"
+            onActivated: stereo.active ? stereo.toggleHelp() : viewModel.toggleOsd()
+        }
+        Shortcut {
+            // 2D：Tab 显隐 mpv 的 OSD（3D 下不参与——3D 的帮助面板是 H，且 present-
+            // ation 窗口不收焦点，Tab 会退化成焦点遍历）。2026-10-26 用户报
+            // "2D 下 Tab 失效"：早前清理 3D 的 Tab 特判时把这条 2D 绑定一起删了。
+            enabled: root.shortcutsEnabled && !stereo.active; sequence: "Tab"
             onActivated: viewModel.toggleOsd()
         }
+        // 3D H/J/K/L：H 走 app filter + QShortcut + QML Shortcut；J/K/L 走
+        // main.cpp 的 StereoKeyFilter（在 QML 之前按 event->key() 拦截，大小写无关）。
         Shortcut {
             // Ctrl+Q 退出（与右键菜单 Quit 一致；走标准退出路径）
             enabled: root.shortcutsEnabled; sequence: "Ctrl+Q"
             onActivated: Qt.quit()
         }
         Shortcut {
-            enabled: root.shortcutsEnabled; sequence: "N"
-            onActivated: viewModel.playlistNext()
+            enabled: root.shortcutsEnabled && !stereo.active; sequence: "Ctrl+Left"
+            onActivated: viewModel.playlistPrev()
         }
         Shortcut {
-            enabled: root.shortcutsEnabled; sequence: "B"
-            onActivated: viewModel.playlistPrev()
+            enabled: root.shortcutsEnabled && !stereo.active; sequence: "Ctrl+Right"
+            onActivated: viewModel.playlistNext()
         }
         Shortcut {
             enabled: root.shortcutsEnabled; sequence: "["
@@ -408,8 +569,11 @@ Item {
             qsTr("Subtitle files (*.srt *.ass *.ssa *.vtt *.sub *.sbv)"),
             qsTr("All files (*)")
         ] : [
-            qsTr("Media files (*.mp4 *.mkv *.webm *.avi *.mov *.ts *.flv *.wmv *.mp3 *.flac *.wav *.ogg *.m4a)"),
-            qsTr("Video files (*.mp4 *.mkv *.webm *.avi *.mov *.ts *.flv *.wmv)"),
+            qsTr("Media files (*.mp4 *.mkv *.webm *.avi *.mov *.ts *.m2ts *.mts *.flv *.wmv *.iso *.mp3 *.flac *.wav *.ogg *.m4a)"),
+            qsTr("Video files (*.mp4 *.mkv *.webm *.avi *.mov *.ts *.m2ts *.mts *.flv *.wmv)"),
+            // 蓝光镜像：默认列表里必须能看见，否则从 UI 根本没机会打开 ISO
+            //（Blu-ray 的 title 枚举/URL 生成只发生在 openFiles 收到 .iso 时）。
+            qsTr("Blu-ray images (*.iso)"),
             qsTr("Audio files (*.mp3 *.flac *.wav *.ogg *.m4a)"),
             qsTr("Subtitle files (*.srt *.ass *.ssa *.vtt *.sub *.sbv)"),
             qsTr("All files (*)")
@@ -450,5 +614,140 @@ Item {
     // root 上找不到该函数 → 运行时 TypeError → 点击无反应。
     function togglePlaylist() {
         playlistPanel.visible ? playlistPanel.close() : playlistPanel.open()
+    }
+    // 测试/调试入口：RPC 在指定位置打开右键菜单（正常从右键进入）。
+    // 用于截图核对菜单排版/分组（RPC `open-menu <x> <y>`）。
+    function openMenuAt(x, y, subIndex) {
+        contextMenu.showAt(uiLayer, x, y)
+        // 可选：直接展开第 subIndex 个条目的二级面板（截图核对分组排版用）。
+        // 必须 callLater：ContextMenu.onAboutToShow 会重置 subOpen/subIndex，
+        // 而它在 open() 期间（异步）才触发 → 立刻赋值会被覆盖掉。
+        if (typeof subIndex === "number" && subIndex >= 0) {
+            Qt.callLater(function () {
+                contextMenu.subIndex = subIndex
+                contextMenu.subOpen = true
+            })
+        }
+    }
+
+    // 测试/调试入口：RPC 打开 3D 选择器（正常从右键菜单进入）。
+    property int stereoPickerMode: 1
+    function openStereoPicker() {
+        stereoPicker.openForMode(stereoPickerMode)
+    }
+
+
+    // 音量提示：独立于 3D 快捷键帮助面板。只在**快捷键**改音量时出现
+    //（视 trigger 源是 volumeNudged，UI 滑杆拖动不弹）；3D 左右眼各一份。
+    StereoVolume {
+        id: volumeOsd
+        anchors.fill: parent
+        z: 99
+        active: !controlMode
+        volume: viewModel.volume
+        muted: viewModel.muted
+    }
+
+    // ── 3D 管线状态 OSD（Tab 切显隐；调试用）────────────────────────
+    // mpv 的 OSD 在 3D 下会被合成分屏切成两半（每行只剩一半字），所以 3D
+    // 改由 QML 画 —— 文本来自 viewModel.osdText（与 mpv 用的同一份）。
+    // 左右眼各一份、**无视差**（零视差 = 落在屏幕平面，长时间看最舒服）。
+    Item {
+        id: pipelineOsd
+        anchors.fill: parent
+        z: 97
+        visible: !controlMode && stereo.active && viewModel.osdVisible
+        Repeater {
+            model: 2
+            delegate: Item {
+                x: index * pipelineOsd.width / 2
+                width: pipelineOsd.width / 2
+                height: pipelineOsd.height
+                Text {
+                    x: 24
+                    y: 24
+                    width: parent.width - 48
+                    text: viewModel.osdText
+                    // 文本按显示宽度补空格对齐（osdTextString 的约定）→ 等宽字体
+                    font.family: "monospace"
+                    font.pixelSize: 15
+                    color: "#e0e0e0"
+                    style: Text.Outline
+                    styleColor: "#c0000000"
+                    wrapMode: Text.NoWrap
+                }
+            }
+        }
+    }
+
+    // ── 3D 进行中提示（桌面 control 窗口中心）──────────────────────
+    // 视频在眼镜屏上，桌面这块是空的（controlMode 不创建 Video）。
+    Column {
+        anchors.centerIn: parent
+        spacing: 24
+        visible: controlMode && stereo.active
+        z: 90
+        Text {
+            anchors.horizontalCenter: parent.horizontalCenter
+            text: "󰊪"   // mdi-glasses U+F02AA（字面字符；\uXXXX 只吃 4 位）
+            font.family: iconFont
+            font.pixelSize: 96
+            color: "#e0e0e0"
+        }
+        Text {
+            anchors.horizontalCenter: parent.horizontalCenter
+            text: qsTr("请戴上眼镜观看")
+            font.pixelSize: 18
+            color: "#e0e0e0"
+        }
+    }
+
+    // 瞬态提示（画面比例/每眼比例等键位操作反馈）。2D 用主 UI，3D 用
+    // presentation 内那一份（下面 progressOsd 旁边）。
+    StereoMessage {
+        id: messageOsd2d
+        anchors.fill: parent
+        z: 98
+        active: !controlMode && !stereo.active
+    }
+    Connections {
+        target: viewModel
+        function onMessageFlashed(value) {
+            if (!stereo.active) messageOsd2d.flash(value)
+        }
+    }
+
+    // 进度提示：快捷键快进/快退时短暂显示当前进度（机制同音量提示）。
+    // 只在 3D 显示——2D 桌面 UI 本身有进度条。
+    StereoProgress {
+        id: progressOsd
+        anchors.fill: parent
+        z: 99
+        active: !controlMode && stereo.active
+        position: viewModel.currentTime
+        duration: viewModel.duration
+    }
+
+    StereoMessage {
+        id: messageOsd3d
+        anchors.fill: parent
+        z: 99
+        active: !controlMode && stereo.active
+    }
+    Connections {
+        target: viewModel
+        function onMessageFlashed(value) {
+            if (stereo.active) messageOsd3d.flash(value)
+        }
+    }
+
+    // 3D 快捷键帮助面板：presentation 内覆盖层（不是独立窗口）；H 只切显示。
+    Loader {
+        id: stereoHotkeyHelpOverlay
+        anchors.fill: parent
+        z: 100
+        active: !controlMode && stereo.active
+        visible: active
+        source: "StereoHotkeyHelp.qml"
     }
 }

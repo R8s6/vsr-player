@@ -2,6 +2,9 @@
 
 > 本文件由 DeepSeek Harness 转写：来源 = 开发机上的 Claude Code 会话记忆（已筛选：保留知识/经验类 6 个主题，移除过程性/过期记录；清洗隐私/密钥后拉入仓库 `docs/memory/`）+ 原 `CLAUDE.md`（已于 2026-08 删除，信息脱节），并已对照 master 代码（`7bae9ce`）修正其中的失效/冲突信息。
 >
+> **⚠ 当前在办任务（接手先读）**：`docs/handover-3d-conversion.md`
+> —— 把 `test.iso` 的 6 个 title 离线转出来（2D 直接压 / 3D 转全宽 SBS），含阻塞点、工具位置、编码参数与已知坑。
+>
 > **本文件是项目的唯一权威指令**。原 CLAUDE.md 含未同步的过时内容与幻觉断言历史（modeset、Wayland embedding 两处已被证伪），删除后不再有冲突源；引用任何技术事实前，仍先对照代码验证（通用"证据优先/结论先验证"原则见 `~/.dsh/AGENTS.md`）。
 
 ## 项目是什么
@@ -58,7 +61,49 @@ Linux 桌面视频播放器：**NVIDIA VFX SDK 实时 AI 超分 / 插帧 / SDR�
    其实一直有（只是 vanished）。修法 = 在**调用点**写 `tag(tr("FRUC"))`，lambda 只做宽度对齐；
    改完必须跑 lupdate（条目会从 vanished 复活并保留原译文）+ lrelease，用
    `lconvert -i x.qm -o -` 反查确认译文真进了 .qm（**不能只看 .ts**）。
+8. **不做人类式工时估算，也不做"最小改动"式偷懒**（2026-10-27 用户要求）——你是按 token
+   写代码的 agent，不是人：
+   - **不说"半天/一天/约两小时"**，也不用"工作量"来给方案排序或劝退；
+   - **不以"改动小/省事"为取舍标准**：不跳过需求里的部分、不留下半成品路径、不为了少改
+     几个文件而把逻辑塞进不合适的位置。需要动几层就动几层（滤镜/客户端/UI/文档一起对齐），
+     实现要对得起规格；
+   - 方案只按**依赖顺序**拆成可执行步骤，每步给出**可验证判据**（能跑的命令 / RPC / 日志行），
+     做完即报结果。
 
+## 已修问题的两个易复发点（2026-10-26，用户报"像是修过的 bug 复现"）
+
+### 1) 播放列表清空后画面停在最后一帧
+
+- **根因不在 mpv**：清空（`playlist-clear`+`playlist-remove 0` 或逐个删到空）后
+  mpv 确实 `idle=yes`、`core-idle=yes`，但**我们的渲染循环是"有新帧才画"**
+  （`Video::requestRender` 判 `mpv_->update()>0`）：idle 之后不再有新帧，
+  `rtImage` 里留着最后一帧，合成节点每帧照旧采样它 → 画面永远停在最后状态。
+- **修法**：`Video::blank_` + 合成 shader 的 `blank` 标志（`CompositeParams.h`
+  与 `composite.frag` 的 push constant 各加一个字段）。`PlayerViewModel` 在
+  **列表非空 → 空**的跃迁和 `stop()` 上发 `playlistEmptied()` → `Video::setBlank(true)`
+  → 请求一次重绘，shader 直接输出 `vec4(0)`；`MPV_EVENT_FILE_LOADED` 时复位。
+  这样**任何一次重绘**（包括锁屏后解锁、切窗口）都是黑的，不依赖 mpv 清帧。
+- ⚠ 不要改成"靠 mpv 自己清 rtImage"：`mpv_render_context_render` 在没有帧时
+  是否清屏取决于 vo/gpu 内部状态，实测清空列表后窗口仍是最后一帧。
+
+### 2) 重启后点播放无反应（概率性）
+
+- **根因**：`playlist` 观察器在 `files.isEmpty()` 时无条件清
+  `lastPath_`/`idlePlayIndex_`（那是为"移除后别复活"加的）。但**启动 idle**
+  时 `restorePlaylistIdle()` 先把重播目标设好，随后观察器投递的**初始空快照**
+  会把它抹掉 → `play()` 的 `!fileLoaded_` 分支无目标、直接 return。事件与启动
+  代码的先后不定 → 表现为**概率性**（用户："似乎存在一定几率触发"）。
+- **修法**：只在**非空 → 空**的跃迁上清（`PlayerViewModel::playlistCount_`
+  记录上次条目数）；初始空快照不再算"用户清空了列表"。`play()` 的早退分支
+  会记 `play: nothing to resume (...)`，下次复现直接看日志。
+- 验证：连续 3 次"重启（idle，count=1/pos=-1）→ 点播放"→ 每次都 `pos=0`、
+  `path` 正确、`video-params/w=1920`。
+
+### 3) stop 也走同一条置黑路径
+
+`stop()`（`stop keep-playlist`，列表保留、媒体卸载）以前同样停在最后一帧，
+现在也 `emit playlistEmptied()`；重播时 `FILE_LOADED` 复位。实测
+`stop → video: blank` / `play → video: content`，并回到原条目。
 
 ## 技术现状（已对照 master 代码修正）
 
@@ -75,6 +120,11 @@ Linux 桌面视频播放器：**NVIDIA VFX SDK 实时 AI 超分 / 插帧 / SDR�
   filter 判据（`vf_vfg.c` 直通判定）：`k × src_fps > max_fps` → `vfg-status: mode=
   passthrough reason=max-fps`；**恰好等于上限允许插帧**（24×2=48 @cap48、30×2=60 @cap60；
   已知帧率路径带 1e-6 相对容差，吸收容器帧率浮点尾数，如 goose 的 demux-fps=30.0000003）；
+  **已知帧率路径的 max-fps 相对容差 1e-4（2026-10-25 修）**：容器
+  `avg_frame_rate` 会有微小漂移（3D 测试片 `4024000/134133 = 30.0000745`，
+  k=2 时输出 60.000149），旧的 1e-6 容差（60.00006）会把它误判成超过
+  `max-fps=60`，整条插帧直通。改成 1e-4（0.01%，仍能拦住 30.1fps×2=60.2），
+  并在 cap 状态变化时打 `vfg: max-fps engaged/released (src=… k=… cap=…)`。
   **src_fps 未知（直播/URL 流）时用输入帧 PTS 间隔的中位数估计**（2026-10-24 修：此前直接
   不判定，60fps 直播 + k=2 + cap=60 仍输出 120fps；现 31 样本窗口/15 预热、2% 死区 +
   30 帧进入 / 60 帧退出去抖；估计值只用于判据、不写回元数据；nominal 已知的源仍走精确值、
@@ -170,6 +220,44 @@ Linux 桌面视频播放器：**NVIDIA VFX SDK 实时 AI 超分 / 插帧 / SDR�
 - **无参数启动 = idle**：只恢复上次播放列表（`restorePlaylistIdle()` 全 `loadfile … append`，mpv 无 current 条目 → 不解码、不建滤镜链、不 Load 引擎、不做续播 seek），按播放才 `resumeLastPath()` → `playlist-play-index` 载入，mpv 用 watch_later 自动恢复上次进度。命令行给了文件、或显式 `-- --pause=yes` → 立即载入（mpv 语义）。
 - 起因：曾有"启动暂停"实现（`pause=yes` 选项 + 启动即载入），但 mpv 精确 seek 会把"关键帧→目标位置"的帧**过完滤镜链再丢掉**（实测 `start=12.302`/关键帧 6.25s → 142 源帧、VFG 570 输出帧白跑、海报晚 1.6s）；日志里那批 `vfg-status` 是丢弃帧不是播放。完整测量与被否方案：`docs/memory/startup-idle-policy.md`。
 - idle 时 mpv 的 `pause` 初值为 false → `pause` 观察器按 `updatePlaying(!p && fileLoaded_)` 判定，否则 UI 未载入就显示"播放中"。
+- **播放列表条目名（蓝光 title）= 交给 mpv，不在客户端做名字表（2026-10-27）**：
+  - 症状：ISO 展开的 title 全显示成 iso 文件名；**关掉再以无参数启动**（idle 恢复列表）
+    之后又变回 iso 文件名。
+  - 根因（两段）：① `PlaylistModel` 只按路径推导显示名（`bd://mpls/N//…` 的 basename
+    就是 ISO 名）；② 启动恢复是逐条 `loadfile bd://mpls/N//…`，**这些条目没有 title**
+    （title 只在 `parse_bluray` 展开 ISO 时才有），于是名字又丢了。
+  - 结论：**名字的唯一来源是 mpv 的 playlist 条目 `title`**
+    （`player/command.c` 的 `{"title", SUB_PROP_STR(e->title)}`），客户端只负责显示。
+    曾经试过在客户端维护"路径→名字"表和 `bdisc::labelFor` 注册表，被用户否掉
+    （"正确的方法不是从 demux 那块入手吗"）——确实是 hack：既重复了 mpv 的能力，
+    又要在"空 title 不覆盖旧名字"上打补丁。
+  - **落地做法**：播放列表持久化成 **m3u8 快照**（`~/.local/share/vsr-player/last-playlist.m3u8`）：
+    ```
+    #EXTM3U
+    #VSR-CURRENT:<当前索引>          ← 自定义注释，mpv 忽略
+    #EXTINF:-1,Title 6 · 1:18:30    ← 条目名（mpv 给的 title）
+    bd://mpls/00003//home/…/x.iso
+    ```
+    恢复时用 mpv 原生 **`loadlist <快照> [append]`** → `demux_playlist` 的 m3u 解析器
+    把 `#EXTINF` 变成 `e->title`（`parse_m3u`，与 ISO 展开同一套机制）；
+    条目名再经 `PlaylistModel::setSnapshot(paths, current, titles)` 显示。
+    `restoredFiles()` 直接解析这份快照（缺文件时回退旧 `playlist`/`playlistCurrent`
+    settings 键，兼容老安装）。
+  - 结果：`bdisc::labelFor/registerLabel/urlFor` 与 `BlurayTitle::label` 已**全部删除**；
+    `PlaylistModel::displayName()` 回到"只用 basename"，名字一律来自 mpv。
+  - 验证钩子：RPC `get-playlist` 打印 mpv 侧 `title/filename`（带 `*`=current、`P`=playing）
+    与模型侧 `model.display`。实测：ISO 会话与无参数重启都显示
+    `Title 1 · 0:00:00 … Title 6 · 1:18:30`；普通视频列表仍显示文件名，索引也随快照恢复。
+  - ⚠ **恢复后的 bd:// 条目一开始点不动（2026-10-27 修）**：`bd` stream 的
+    `stream_origin` 是 **UNSAFE**，mpv 的 origin 检查只放行 DIRECT 来源；m3u 快照
+    是本地文件（FS 来源）→ 里面的 `bd://` 条目被拒。而 `stream_create()` 的循环把
+    UNSAFE 当 NO_MATCH 继续，最终**报成 "No protocol handler found"**（很容易误判成
+    "URL 存错了"）。ISO 展开那条路径没事，是因为 `parse_bluray` 分支已把条目提升为
+    DIRECT（我们自己的 patch）。修法（`src/mpv/demux/demux_playlist.c`）：本地
+    播放列表（`demuxer->stream_origin == STREAM_ORIGIN_FS`）里以 `bd:`/`bluray:`
+    开头的条目逐条提升为 `STREAM_ORIGIN_DIRECT`；**远程列表仍按 mpv 原始策略拒绝**。
+    验证：重启→列表有 title→点任一 title 正常播放（日志 `Playing: bd://…` 后直接出
+    音频/视频流，无协议错误）。
 - **打开文件夹 = mpv 原生目录展开（2026-10-21）**：`openFiles` **不扫描目录**，目录路径原样交给 mpv `loadfile`（`main.qml` 的 FolderDialog 用 mode 0，与拖入窗口的 DropArea 同一条通路）。mpv `demux_playlist` 按 `--directory-mode`（默认 lazy）与 `directory-filter-types`（默认 video/audio/image/archive/playlist）展开：顶层媒体成条目（文件在前、目录在后，`mp_natural_sort_cmp`）、**子目录作为条目留在列表**、点击时再展开（`playlist-play-index` 后目录条目原地替换为其内容，`PlaylistModel` 前缀 diff 照常处理）。旧实现（mode 3）用 Qt `QDir::entryList` 只扫顶层固定扩展名表 → 子目录/图片/播放列表全丢，与拖放不一致，已删除。证据：测试目录（2 媒体 + 1 子目录 + 1 软链目录 + txt/srt）装载后 mpv 与播放器均 4 条目，点目录条目展开为其中文件。
 - **播放列表面板"空白"根因与修法（2026-10-21）**：`PlaylistPanel` 是 `Drawer`（Popup）。关闭时 popup 内容从场景树摘除；**关闭期间**播放列表增删（换片/追加/目录展开）后，ListView 的 delegate 保持旧几何（实测 120→20 条重开后 delegate y 仍是 4326..4872，而 contentHeight=840）→ 视口内没有任何条目 = 面板空白，且**不自愈**（第一次滚轮才跳回）。修法：ListView 放进 `Loader`，`onOpened` 创建 / `onClosed` 销毁（每次打开都是全新布局）；另加 `clampScroll()`（`contentHeight/height/count` 变化时 `Qt.callLater` 夹 contentY，`boundsBehavior: StopAtBounds`）与滚轮 handler 对**全部** wheel 帧 `accept`、写入前 `cancelFlick()`（避免手写 contentY 与 Flickable 的 wheel flick 两套滚动互相打断）。验证：修复前重开截图为空，修复后显示 20 条；120 条滚到底 contentY=4368、末条 120 可见。新 ListView 全新建局 → 每次打开都会重建；`onLoaded` 里 `positionViewAtIndex(currentIndex, ListView.Center)` 把当前播放条目居中（实测 index 61/120 → contentY=2205，前后各 ~16 条可见），无 current（`currentIndex<0`）时回到顶部。
 - **两个拖放区（2026-10-21 确认）**：A = 窗口级 `DropArea`（`main.qml`）→ mode 0，**完全重置**播放列表（首条 replace 播放、其余 append 排队）；B = `PlaylistPanel` 的 `DropArea` → mode 1，**追加**（不打断当前播放）。面板打开时 B 在 popup overlay（`QQuickOverlay` 是 contentItem 的子项、创建在 QML 根之后）里叠在 A 之上，Qt 的拖放投递按 `paintOrderChildItems()` **从上到下找第一个接受者**（`qquickdeliveryagent.cpp: deliverDragEvent`），所以两个区不会同时触发。**追加目录**同样走 mpv 原生语义：`loadfile <dir> append` 只留一个目录条目、点击才展开（实测：追加后列表 = `[/tmp/vsr-dir-test]`，点击 → 4 条目并播放首条）。
@@ -236,6 +324,28 @@ Linux 桌面视频播放器：**NVIDIA VFX SDK 实时 AI 超分 / 插帧 / SDR�
 - **marker 必须留到过期，否则"偶发特别慢"（2026-10-22 实测更正）**：一次 seek 里 mpv 会把目标之前的帧**喂两遍**——第一遍驱动到目标（marker 生效，drop loop 丢 297–450 帧），随后 `vsr: reset`（链 reset）之后再从更早的位置喂 60–130 帧（0.5–2 s 的量）。早先实现"首个 >= 目标的帧就清 marker"，这批迟到帧便逐帧进引擎（2.8 ms/帧）→ 单次 seek 多 **200–400 ms**，正是按住方向键时"连续几次快必有一次特别慢"。**修法**：marker 只在 3 s 过期或下一次 `seek-target` 时清除，正常播放零影响（每帧只多一次 pts 比较）。**实测（catlove_470s，60 fps，VSR auto 2×）**：单步中位 **53 ms**（p90 137 / max 167），按住 25 Hz 3 s → **29 步 / +148 s**（修前 12 步 / +64 s），与 `set-vsr off` 的 29 步 / +149 s 持平；60 Hz → 33 步 / +168 s（VSR off 46 步 / +234 s）。⚠ 之前"剩余慢步 = 精确 seek 固有解码成本（VSR off 同样慢）"的结论**作废**：那次 VSR off 的 324 ms 也是迟到帧 + 当时的系统负载所致，与 VSR 无关。
 - **不改用关键帧 seek（实测否决）**：mpv 原生相对 seek（`seek +5 relative`，即其方向键语义）在按住 25 Hz 时**累加**目标，3 s 内位置 +439 s（画面整段飞过），60 Hz 直接冲到文件尾并回绕；它的"每帧看着正常"只是因为画面在整段跳。门控 + 精确绝对 seek（每步严格 +5 s、落点精确）在修好 marker 之后速度已与关键帧同级，因此保留现语义。
 
+### ⚠ 运行期选项"重建继承"（2026-10-27 修：关掉旋转后重播仍是旋转的）
+
+**现象**（用户报）：播放中把旋转切到 90° 再关回 Off，之后每次播放**开始瞬间画面仍是旋转的**。
+
+**根因**：链串（`vfOption()`）是**加载时**的快照，而运行期状态走 `vf-command`。二者不一致时：
+
+1. mpv 重建用户滤镜链（解码器重配/换片/格式变化）→ 用**链串旧值**建实例（angle=90）；
+2. 客户端在 reconfig 后又把当前值推回去（angle 0）→ 输出尺寸 1080×3840 ↔ 3840×1080 来回变；
+3. 尺寸变化又触发重配 → 回到 1 —— **无限重建 + 尺寸翻转**（实测日志刷出几十轮
+   `rot: 90 deg … -> angle 90 -> 0`，每次 `kernels compiled` 都是新实例）。
+
+**修法**：滤镜实例重建时**继承"最后一次 vf-command 的状态"**（进程内 static，
+`vf_rot.c` 的 `g_last_angle`、`vf_eye.c` 的 `g_last_mode/layout/half`），而不是回到链串值。
+这样重建后立刻就是当前状态，尺寸不再翻转 → 循环消失、启动瞬间也不再闪旋转。
+
+**验证**：配置里预置 `rotMode=90` 启动 → 播放中 `set-rotate 0` → `stop`/`play`：
+重播瞬间尺寸就是 3840×1080；`rot: kernels compiled` 计数从几十次降到 **1** 次。
+
+⚠ 这套 static 只对**会改变输出尺寸**的选项（rot / eye）是必需的（不改尺寸的选项
+链串与运行期不一致最多影响一帧画面，不会形成重建循环）。`vf_vsr` 的 scale 实测不改
+链串、也不触发重建循环（`vsr: init` 2 次，`vsr: reset` 0 次）。
+
 ### 旋转（vf_rot，CUDA 零拷贝，2026-10-25）
 
 - **链上位置**：`hwup → rot → vsr → truehdr → vfg`（VFG 链；RIFE 链为
@@ -255,6 +365,261 @@ Linux 桌面视频播放器：**NVIDIA VFX SDK 实时 AI 超分 / 插帧 / SDR�
   面板机制，`subIndex` 区分展开项）；RPC `set-rotate 0|90|270` / `get-rotate`。
 - ⚠ 旋转在 VFG **之前** → 横转竖会让 VFG 输入变成竖屏（如 720x1280）走慢路径
   （见插帧一节的竖屏实测），竖转横则相反。这是"VFX 之前旋转"的固有代价。
+
+### 3D 下的 VSR auto 倍率（2026-10-26，**按每眼算**）
+
+**结论**：`scale=auto` 在 3D 下必须按"**单眼视口 vs 单眼源像素**"算，不能用整帧 vs
+整块 framebuffer（那是 2D 的算法）。
+
+```
+eyeW = outW/2, eyeH = outH          （输出 framebuffer 恒为 SBS）
+imgW/imgH（单眼源像素）:
+  SBS 全: (srcW/2, srcH)      SBS 半: (srcW, srcH)
+  TAB 全: (srcW, srcH/2)      TAB 半: (srcW, srcH)
+need = min(eyeW/imgW, eyeH/imgH)    → 再按 SDK 支持集取档（4/3,1.5,2,3,4；≤1 → 1×）
+```
+
+- **SBS 全与 2D 公式代数等价**（`min((outW/2)/(W/2), outH/H) = min(outW/W, outH/H)`）
+  → 历史上只用 SBS 全测试，所以一直没暴露。
+- **TAB 全会偏软**：源每眼只取半高，2D 公式按整高比 → 实测 960×720 TAB 在
+  3840×1080 上应 2.0×，旧公式只给 1.5×；1440×1080 TAB 应 1.33×，旧给 1.0×。
+- **半幅会偏大**（源已沿 split 轴拉伸到整帧）：1920×360 SBS 半 应 1×，旧公式 2×。
+
+**实现**：`vf_vsr` 两个选项 `stereo-layout`(-1|0|1) / `stereo-half`(0|1) 进**链串**
+（所以链重建后自动恢复），运行期 `vf-command vsr stereo <sbs|tab> <full|half>|off`
+热切（不重建链）。客户端由 `PlayerViewModel::setStereoMap()` 在
+`StereoController::stateChanged`（含 J/K/L）时推。
+
+⚠ **链重建会抹掉运行期 vf-command**：mpv 在解码器软硬切换/格式变化时用
+**加载时的 vf 选项串**重建用户滤镜链（不只是 3D——rot/truehdr/vfg 的运行期值同样
+受影响）。实测 3D 倍率在软硬解码切换后回到 2D 公式。修法 = 客户端挂
+`MPV_EVENT_VIDEO_RECONFIG` → `replayStereoMap()` 补推（链串里也带值，双保险）。
+
+**实测（本机 3840×1080 framebuffer，30fps 源 + VFG×2 → 60fps；目标 1080p@60）**：
+
+| 场景 | 倍率 | VSR cost | 实测 fps | 丢帧 |
+|---|---|---|---|---|
+| 3840×1080 SBS 全（1080p 每眼） | 1.00 | passthrough | 60.0 | 0 |
+| 3840×1080 SBS 半 | 1.00 | passthrough | 60.0 | 0 |
+| 1920×1080 SBS 全 | 1.00 | passthrough | — | 0 |
+| 1920×2160 TAB 全 | 1.00 | passthrough | 60.0 | 0 |
+| 1280×720 SBS 全 | 1.50 | 3.4 ms | **60.00** | 0 |
+| 960×720 TAB 全 | 2.00 | 2.3 ms | **60.00** | 0 |
+| 640×360 SBS 全 | 3.00 | 1.0 ms | **60.00** | 0 |
+
+GPU 占用：1080p 每眼 SBS（VSR 直通）+ VFG×2 @60fps = **13%**（RTX 5060 Ti）。
+即 1080p@60 在 3D 下有大把余量；VSR 真正活跃的只有低于 1080p/眼 的 3D 片源，
+最贵一档（1.5×）也只有 3.4 ms/源帧（×30 = 约 10% GPU）。
+
+⚠ 测试钩子（无眼镜时也能测 3D 路径）：`set-stereo-map off|<sbs|tab> <full|half>`
+（走客户端同一入口、会被重放）；另有通用 `vf-command <filter> <cmd> [arg]`。
+测 3D 的 framebuffer 尺寸时用 `resize 1920 540`（DP-3 是 dpr 2 → framebuffer 3840×1080）。
+
+### 3D 输出（OSD + 视频映射，2026-10-25，分支 feat/stereo-osd-prototype）
+
+- 入口/流程：右键菜单 3D 三态 **Off / 3D片源 / 2D转3D**（运行期、不持久化，默认 Off）。
+  3D片源 → 选择器（QScreen `model` + `name` + **物理分辨率**；**不假设 1080×2/
+  不按宽高比猜眼镜**；屏幕记忆只做默认选中，不自动切屏/启动）→ Start。
+  2D转3D 本期只弹提示，不启动。
+- ⚠ Wayland 下 `QScreen::geometry` 是**逻辑**尺寸（VITURE 报 2844×800，物理
+  3840×1080）；选择器通过 `kscreen-doctor -j` 的 `currentModeId` → mode `size`
+  取物理分辨率（KDE/KWin 专属；找不到工具时退回 QScreen 尺寸）。`QScreen::model`
+  （VITURE/DELL/LG）用于显示名称。
+- 菜单/选择器关闭顺序：`ContextMenu` 二级项**先发 subSig 再 close**——
+  close 会拆 popup 的临时 grab/内容，之后 `root[subSig]` 的动态调用可能不生效
+  （2026-10-25 实测 3D 二级项点击无反应）；主 QML 在 `onStereoSelected` 里
+  **先 `contextMenu.close()`，再 `Qt.callLater` 打开选择器**，不能依赖
+  “打开另一个 popup 自动关旧的”。`StereoPicker` 的 Start 仍先 close 再
+  `stereo.start`。选择器打开时不再同步跑 `kscreen-doctor`（屏幕列表由
+  screenAdded/Removed/geometryChanged 维护），避免点菜单后卡顿。
+- ⚠ **Popup 生命周期（2026-10-25，不是 Qt 屏 bug）**：`ContextMenu`/`StereoPicker`
+  都是默认的 **`Popup.Item`**，内容项被 reparent 到窗口 overlay，不是独立窗口；
+  打开另一个 popup **不会**自动关前一个，`uiLayer.visible=false` 也**不会**隐藏
+  overlay 里的 popup。所以打开选择器前必须显式关菜单；`stereo.active=true` 时
+  主 QML 关闭主窗口所有 popup（context/playlist/picker 等），否则它们会跟着
+  主窗口一起移到眼镜屏。Qt 文档/源码（`qquickpopup.cpp` 的
+  `adjustPopupItemParentAndWindow`、`qquickpopupwindow.cpp`）与社区报告
+  （QTBUG-67684、QTBUG-35261）都是这个语义，不是 QScreen/合成器放错屏。
+- **Context menu 仅 UI 窗口可用**（2026-10-25 用户要求）：`MouseArea` 与
+  `ContextMenu.enabled = controlMode || !stereo.active` —— 2D 用 main 窗口，
+  3D 用 control 窗口（桌面主 UI）；presentation 窗口禁用右键/菜单。
+- **Context menu 及时关闭**：选 3D 片源时 `onStereoSelected` 先
+  `contextMenu.close()` 再 `Qt.callLater` 开选择器；`stereo.active` 变 true、
+  `uiLayer.visible=false`（自动隐藏/进 3D）、`window.active=false`、
+  `window.visible=false` 都显式 `contextMenu.close()` + `stereoPicker.close()`；
+  打开其他 popup 仍走 `uiLayer.closeOtherPopups()`。
+- 3D active 期间 `Escape` Shortcut 禁用（主窗口被合成器聚焦时 Esc 退全屏会切回
+  焦点屏）；退出用桌面 3D → Off。
+- **主 UI 始终在桌面**：KWin 把新窗口放到当前活动输出——用户鼠标在眼镜屏时
+  主 UI/右键菜单会开到眼镜上。`main.cpp` 在 `view.show()` 后把主窗口移到
+  `QGuiApplication::primaryScreen()`；`StereoController` 选 control 屏时若
+  主 UI 原来就在目标（眼镜）屏，改用 primary/其他非目标屏。control 窗口用
+  `show() → setScreen(controlScreen) → setGeometry()`（Wayland 初始放置看
+  active output，show 前 setScreen 不生效）。`main.cpp` 另建一个
+  `QQuickView controlView`，加载同一份
+  `main.qml` 但 `controlMode=true` → `Video` Loader 不创建，只有 UI。2D 时它隐藏、
+  主窗口（Video+UI）在桌面；3D 时主窗口去眼镜屏做 presentation，controlView 在主窗口
+  原来的屏幕/几何上显示，主 UI 不消失。3D 快捷键只在 control 窗口启用（两个窗口都载入
+  main.qml，避免 `Qt.ApplicationShortcut` 重复触发）。
+- **⚠ 主窗口全屏时投不到眼镜屏（2026-10-26 用户报，已修）**：KWin 把**全屏窗口
+  钉在它所在的输出上** —— 对全屏窗口调 `setScreen()` 被忽略，`showFullScreen()`
+  又是 no-op（本来就是全屏），于是窗口留在原屏；`get-stereo` 会显示
+  `out=3840x2160`（原屏）而不是眼镜的 3840×1080。**修法**：换屏前先 `hide()`
+  （`showNormal()` 不够），再 `setFlags` → `setScreen` → `showFullScreen`；
+  `stop()` 恢复正常屏幕时同理（否则退出 3D 后画面留在眼镜屏）。两处都要，
+  只修 start 会出现"进得去、出不来"。实测（DP-3 3840×2160 全屏 ↔ DP-1 眼镜
+  3840×1080）：`全屏 3840×2160 → 3D 3839×1080 → 退出 3840×2160`；窗口态
+  `2560×1440 → 3839×1080 → 2560×1440`，可重复进出。
+  ⚠ 日志只记屏幕名（`stereo: presentation window -> DP-1 (was fullscreen)`）：
+  窗口 `geometry()` 在 `showFullScreen()` 之后还没稳定，记出来是旧值，会误判。
+- **presentation** = 主窗口（Video/VO）：`setScreen(眼镜屏)` + `showFullScreen`，加
+  `FramelessWindowHint | WindowStaysOnTopHint | WindowDoesNotAcceptFocus`，光标 Blank；
+  主窗口 uiLayer 在 3D 时隐藏；3D 快捷键帮助面板是 presentation 内的 `StereoHotkeyHelp.qml` 覆盖层
+  （Loader，z=100），不是独立窗口。`H` 只切覆盖层；`J/K/L` 改布局/眼序/全半。
+  实测 KWin 下满屏置顶覆盖了任务栏/面板，无其他可见内容。停止时恢复主窗口 flags/
+  光标/屏幕/几何，隐藏 controlView。
+- **屏拆分在 VO/合成阶段**：`vf_*`（VSR/VFG/TrueHDR）链路不动，滤镜仍处理完整
+  源帧；`CompositePipeline` 用 push constants 把输出窗口左右半映射到左右眼。
+  实测 VSR 仍 active（scale 随 presentation 窗口自动变 1.5），VFG 的
+  passthrough 是既有 `max-fps` 判定，不是 3D 改动。
+- **映射语义**（用户 2026-10-25 定）：SBS=左右，TAB=上下；`L` 按 split 轴切
+  **全/半**，全/半是**源眼输出宽高**的区别，不是 box：
+  - **全**：源眼像素尺寸原样（SBS = srcW/2 × srcH；TAB = srcW × srcH/2），
+    **不拉伸**；
+  - **半**：源眼沿 split 轴拉成**源整帧像素尺寸**（srcW × srcH）：SBS 横向 2×、
+    TAB 纵向 2×；
+  - **最后统一按眼窗口 contain 等比缩放**：`scale = min(eyeW/imgW, eyeH/imgH)`，
+    可放大/缩小、不拉伸，居中，余量留黑边。
+  - 例 1920×1080 SBS：全 960×1080 → 960×1080，半 1920×1080 → 1920×1080；
+    例 960×720 SBS：全 480×720 → **720×1080**，半 960×720 → **1440×1080**
+    （眼视口 1920×1080）。
+  目标屏按实际尺寸；输出 framebuffer 恒 SBS，因此**眼视口 aspect = outAspect/2**
+  （曾误用 outAspect 导致画面窄一半，已修）。`StereoCompositeParams` 带
+  `srcW/srcH/outW/outH`，全/半按源像素算（不是按眼视口缩放）。源帧在 rtImage 里是 mpv letterbox 后的
+  内容，先算 contentRect 再取样。无红绿/anaglyph。
+- **分屏必须整数化（2026-10-26，用户报"左右眼偏差"）**：Wayland 分数缩放下
+  framebuffer 宽会是**奇数**（VITURE：逻辑 2844×800、scale 1.35 → 物理 3840×1080，
+  但 `win->width()*dpr` = **3839**）。按 `uv.x < 0.5` 分屏时 eyeW = 1919.5：
+  - 两眼采样网格差**半个像素** → 整幅画面恒定水平视差（等于给所有内容加了一个
+    会聚偏移）；实测两眼的差异在±1 像素平移测试里最小值落在 0 与 1 之间；
+  - 修法两层：① 渲染目标/合成视口宽度**向上取偶**
+    （`Video::compositeWidth()` 3839 → 3840，多出的 1 列落在窗口外被裁掉），
+    于是 `splitX = outW/2 = 1920`、眼 1920×1080、`scale = 1.0` → **1:1 像素、
+    无重采样、无黑边**；② `composite.frag` 分屏按**整数像素**判（
+    `px = uv.x*fbW; eye = px < splitX`，两眼都用 `splitX` 作眼宽、超界夹取边缘），
+    不再有 `outW/2.0` 这种小数参与几何。
+  - 验收（自造片：左右两半**逐位相同**的静态 SBS，`grab-window` 后逐像素比）：
+    修前/修后 = 眼内 mean|Δ| 0.39 → **0.0003**、p99 14 → **0**（残余只剩画面
+    最外侧 1–2 列 = mpv 对源帧边框的 clamp）；DP-3（偶数 3840 宽）对照组
+    同样是 p99 = 0。满屏判据也从每眼 1919×1079（底部 1 行黑）变成 1919/1920×**1080**。
+- **⚠ 暂停时切 3D 会只剩半屏（2026-10-26 修，用户"3840×1080 不能满屏"的真凶之一）**：
+  rt 重建走"尺寸连续 `RT_STABLE_FRAMES`(10) 帧未变才重建"的节流，靠 updatePaintNode
+  被反复调用推进；**暂停时没有新帧 → updatePaintNode 不再被调 → 计数器停在 1**，
+  rt 永远停在旧尺寸（如 2560×1440）。此时 mpv 仍把 3840×1080 塞进 16:9 的旧 rt
+  （画面只占中间 50% 高），而 composite 已按新窗口取样 → 看起来就是"不能满屏"。
+  修法：① 尺寸未追平时在 updatePaintNode 末尾自我驱动 `update()`（到阈值即停，
+  不会无界循环）；② 重建成功后 `renderRequested_ = true` **强制本帧重画**——新建的
+  rt 是空图，暂停时 mpv 不会自己再画一次（只修①会得到"rt 对了但画面全黑"）。
+  实测：暂停 + seek 后切 3D，日志出现 `render target 3840x1080` 且画面满屏。
+- **3D 映射参数有 INFO 日志**：`stereo map: out=… splitX=… src=… layout=… half=…
+  swap=… -> eye=… content=…`（参数变化时一行，`Video::stereoParams`）。
+  用户报"不满屏/两眼错位"时先看这行：`eye` 是每眼视口、`content` 是实际贴图尺寸
+  （= 眼视口 = 满屏；比眼视口小 = 有黑边，差值就是黑边）。
+- OSD：默认显示；`Tab` 显隐；`J` 布局、`K` 交换眼、`L` 全/半；标题/键名 Bold、
+  正文 DemiBold；左右面板 ±12 logical px 交叉视差（OSD 浮在画面前，独立于视频眼序）。
+- **3D 快捷键帮助面板（HotKeys，2026-10-25/26）**：**两列、一键一行、无分组名**。
+  左列 3D：H / J / K / L；右列播放器：Space / ← / → / Shift+← / Shift+→ /
+  ↑ / ↓ / Ctrl+← / Ctrl+→（方向键、Shift+方向键、音量上下、上/下一个都各占一行）。
+  `HotkeyRow` 的键名列**统一 100px**，状态/说明从同一 x 起（所有行左对齐）；
+  3D 状态**不用按钮**，纯文本 + 颜色区分（选中 `#ffcc00`，未选 `#e0e0e0`），
+  避免按钮宽度破坏对齐；切换后该行淡黄闪 500ms。OSD 全部文字只用
+  **一个字号 = 18**（标题/键名/状态/说明同字号；标题也不加粗/不放大），
+  不再有 20/24/32 等多套；行高 32。
+  左列 `H: Toggle HotKeys Help`、`J: 左右并排 / 上下并列`、`K: Normal Eyes / Swapped Eyes`、
+  `L: Full / Half`；右列 `←`/`→`（±5s）、`Shift+←`/`Shift+→`（±10s）、
+  `↑`/`↓`（音量 ±）、`Ctrl+←: Previous`、`Ctrl+→: Next`（中文“上一个/下一个”）。
+  OSD panel 宽高按内容（`contentWidth` 在 Repeater delegate 内，不能放 root），
+  左下/右眼两份 + 交叉视差不变。
+- ⚠ **3D 快捷键帮助面板的 i18n 输入**：`StereoHotkeyHelp.qml` 不在 client 根目录的 `ui/*.qml`
+  glob 里，`scripts/update-translations.sh` 已显式加入；否则 OSD 全部回退
+  英文（2026-10-25 修）。当前 zh_CN OSD：热键/左右并排/上下/正常眼序/
+  交换眼序/全/半/播放器/播放暂停/快退快进/音量。
+- ⚠ **3D 热键统一装在 `QGuiApplication` 上**（2026-10-25）：装在两个
+  `QQuickView` 上时，3D 焦点可能在 presentation/control 任一窗口，事件到不了
+  过滤器。`StereoKeyFilter` 现在 `qApp->installEventFilter()`，按
+  `event->key()` 拦截：H/J/K/L（切换）+ Space（播放暂停）+ ←/→（±5s）+
+  Shift+←/→（±10s）+ ↑/↓（音量）+ Ctrl+←/→（上一个/下一个）。大小写无关、
+  允许 Shift；Alt/Meta 不拦；Ctrl 只处理 Ctrl+←/→，其它 Ctrl 组合放行。
+  切换类忽略 auto-repeat，方向/音量允许连发。
+  QML 里 3D 的 J/K/L 已删除，Space/方向/音量在 3D 时禁用
+  （`&& !stereo.active`），只留 2D 路径；C++ 负责 3D，避免重复触发。
+  **OSD 帮助键已从 Tab 改为 H**（用户 2026-10-26 定）：所有 Tab/Backtab 相关代码
+  已全部回退/删除（app filter、QShortcut、QML Shortcut、QQuickView::event 特判、
+  send-key RPC），`WindowDoesNotAcceptFocus` 与 presentation 的 flags 恢复原样。
+  H 是普通键，走 `StereoKeyFilter` + `QShortcut` + QML `Shortcut` 三条普通路径。
+  注意：2D 主窗口的 QML `Shortcut` 本来就能触发 Tab（有焦点的主窗口），
+  3D 失效是当时该 Shortcut 被 `!stereo.active` 禁用后，C++ 路径又受窗口焦点影响，
+  不是“Tab 不能由 QML 处理”。
+- **上一个/下一个 = 全局 Ctrl+← / Ctrl+→**：2D 走 QML `Shortcut`
+  （`enabled && !stereo.active`），3D 走 C++ 过滤器；`Ctrl+L` 是 URL 输入，
+  与 Ctrl+方向键不冲突，项目内无重复绑定。
+- **3D 进行中提示（2026-10-26）**：桌面 control 窗口正中显示 **MDI `glasses`
+  U+F02AA** 大图标（`pixelSize: 96`）+ `qsTr("请戴上眼镜观看")`（18px，`#e0e0e0`），
+  显示条件 `controlMode && stereo.active`。视频在眼镜屏上，桌面这块本来就是空的
+  （controlMode 不创建 Video）。⚠ 图标码点必须写**字面字符**：`\uF02AA` 会被
+  QML 解析成 `\uF02A` + "A"（本项目踩过两次；我第一次查 cheatsheet 也把 U+F02A8
+  = glass-tulip 当成了 glasses，截图里是个高脚杯才发现——正确是 U+F02AA）。
+- **3D 下 Tab 切管线状态 OSD（2026-10-26 用户要求）**：`StereoKeyFilter` 在 3D 时
+  吃掉 `Key_Tab`/`Key_Backtab` → `viewModel.toggleOsd()`，2D 仍走 QML `Shortcut`。
+  ⚠ **3D 下 mpv 的 OSD 必须关掉**：osd-msg1 是画进视频帧的，合成器按左/右半幅切开
+  → 每行只剩半个字，完全不可读。所以 `osdPoll()` 里 3D 时强制 `osd-level=0`，文本
+  另存 `osdText`（互斥量保护，事件线程 emit `osdTextChanged`），由 presentation
+  窗口的 QML 覆盖层 `pipelineOsd` 画：左右眼各一份、**零视差**（落在屏幕平面）、
+  左上角 24px、`font.family: "monospace"`（osdTextString 按显示宽度补空格对齐，
+  等宽才不歪）、带 `Text.Outline` 保证在亮画面上可读。`osdVisible` 是单一状态，
+  两种渲染器共用（新增 `Q_PROPERTY(bool osdVisible)` + `Q_PROPERTY(QString osdText)`）。
+  测试钩子 `toggle-osd`（不注入按键）。
+- **3D 二级面板分组（2026-10-26）**：`submenu` 支持 `{header: "…"}` 分组标题与
+  `{group: 1, value: …}` 分组 id；点击时 `root[it.subSig](value, group)`，
+  勾选态用 `it.current(group)` 按组求值（`signal stereoSelected(int value, int group)`）。
+  3D 面板现在是两组：**输出设备**（`XR 眼镜`，值为 `stereo.outputType`，默认 0）
+  + **显示方式**（不使用/3D片源/2D转3D，值为 `stereo.mode`）。`outputType` 目前
+  不影响渲染路径，是前向占位（将来接 3D 电视需 SBS-half 拉伸几何、VR 头显需 OpenXR）。
+  ⚠ **分组分隔线只在两组之间**（用户 2026-10-26 定）：第一个 header 上方不画线
+  （`visible: isHeader && index > 0`），否则面板顶部会多一条贴边线。
+  ⚠ **面板不能超出主菜单高度**：popup 高度 = 主菜单高度，二级面板是自绘子项，
+  超出会被裁掉 → `subY` 按 `mainPanelH - subPanelH` 做底部钳制并整体上移；
+  `subPanelH` 按实际行高累加（header 行矮 4px）。
+- **进度提示（2026-10-26）**：`ui/StereoProgress.qml`，与音量提示同一套机制
+  （底部居中面板 300×56、1.5s 自动隐藏、3D 左右眼各一份 ±12 logical px 视差、
+  `#cc111111` 面板 + `#44ffffff` 轨道 + `#e0e0e0` 填充），显示"当前 / 总时长"+进度条。
+  **只在 3D 显示**（2D 桌面 UI 本身有进度条）；触发源 = `viewModel.seekNudged()`
+  —— 只有 `seekRelative()`（快捷键/方向键）发，拖进度条走 `seekAbsolute()` 不发。
+- **音量/进度提示的触发源必须区分 UI 与快捷键（2026-10-26 用户要求）**：
+  `PlayerViewModel::nudgeVolume(delta)` 供快捷键用（↑/↓ 的 QML Shortcut 与 C++
+  `StereoKeyFilter` 都走它），它发 `volumeNudged()`；滑杆走 `setVolume()` 不发。
+  `StereoVolume` 只听 `volumeNudged` → 2D 下**拖滑杆不弹**、按 ↑/↓ 弹（用户批准）。
+  实测（像素差，基准=静置帧）：2D 快捷键音量 8136 px / 2D 快捷键快进 0 px /
+  2D 滑杆改音量 0 px；3D 快捷键快进 32270 px、音量 31078 px，1.8s 后均归 0；
+  两眼面板中心 +16 / −15 物理像素（= 12 logical × dpr 1.35）。
+  测试钩子：`nudge-volume <±delta>`（模拟快捷键，与 `set_property volume` 区分）。
+- **音量提示（2026-10-26）**：独立的 `ui/StereoVolume.qml`，**不是** 3D 快捷键
+  帮助面板内容，与 `helpVisible` 完全无关。2D 一份；3D 左右眼各一份（±12 视差）。
+  音量变化时显示 1.5s，系统 OSD 风格（扬声器图标 + `#44ffffff`/`#e0e0e0` 横条 +
+  百分比）；2D/3D 都显示，`controlMode` 不显示。绑定 `viewModel.volumeChanged`。
+- **3D 映射变化必须重绘当前帧**：`StereoController::stateChanged` 连到
+  `Video::update()`；否则暂停时切 L（全/半）只改帮助面板状态，画面要等下一帧。
+- **窗口关闭语义**：`StereoView`（presentation/3D 窗口）在 3D 时收到 close
+  → `ignore()` + `stereo.stop()`，3D 菜单随 `mode_=0` 回退“不使用”，不退出；
+  2D 时正常关闭 → 退出。`ControlView`（桌面主窗口）关闭 → `quit()`。
+- **文案**：“左右并排”不变；“上下”统一为“上下并列”（zh_CN OSD 译文）。
+- 不做“切回 2D 自动结束 3D”（目标不一定是 1080×2，无法可靠判断）；只有目标屏被
+  拔掉时 stop。`Esc` 不参与 3D。
+- 测试钩子（RPC）：`stereo-start <1> <screen-index>`、`stereo-stop`、
+  `stereo-help <0|1>`、`stereo-cycle layout|swap|half`、`stereo-picker <1>`、
+  `grab-window <png>`。
+- 待做：i18n、2D→3D、多轨/其他 3D 格式、control UI 视频区域（当前黑底，视频只在
+  presentation）。
 
 ### 反交错（mpv 原生 `--deinterlace`，2026-10-22）
 
@@ -308,6 +673,94 @@ Linux 桌面视频播放器：**NVIDIA VFX SDK 实时 AI 超分 / 插帧 / SDR�
 - Toggle 与 `send_field` 的连带影响：反交错在链最前面 → VSR 按翻倍后的帧数计费；
   VFG 按 `k × 反交错后帧率` 判 `max-fps`（默认 60：50p 源 ×2 = 100 > 60 → 直通）。
 
+### 蓝光 ISO / BDMV（2026-10-26，按"文件夹"展开）
+
+**容器语义（2026-10-26 用户要求，"像文件夹 / m3u 那样"）**：**扩展了 mpv**——
+`.iso` 由 `demux_playlist` 展开成 title 条目，客户端不再自己造 URL。三个 overlay 文件：
+- `src/mpv/demux/bluray_image.h`（新增）：`mp_is_bluray_image()`——本地路径 +
+  扩展名 `.iso` + `bd_open()` 能枚举出 title 才算（只读元数据，毫秒级）。
+- `src/mpv/demux/demux_playlist.c`：新增 `parse_bluray()`（挂进 `playlist_formats[]`
+  首位），生成 `bd://mpls/<%05u>//<绝对路径去掉前导 />` 条目并设 `title`
+  （`Title N · H:MM:SS`）。
+- `src/mpv/demux/demux_lavf.c`：入口处对蓝光镜像 **主动让路**（`return -1`）。
+  ⚠ 必须这么做：demuxer 列表里 lavf 排在 playlist **之前**，而 lavf 会"认领"任何文件
+  （把 ISO 当成无流的 mpeg），不拦就永远走不到 playlist。
+- `src/mpv/options/options.c`：`playlist_exts` 加 **`iso`**。
+  ⚠ 不加的话"打开一个**只装了 .iso 的文件夹**"会得到 **0 条目**：目录展开
+  （`parse_dir` → `test_path`）只按扩展名表挑选，而 `iso` 原本既不在
+  video/audio/image、也不在 archive/playlist 表里 → 目录当成普通文件打开、
+  报 `Failed to recognize file format`，播放列表里只剩一个点不动的目录条目
+  （2026-10-26 用户实测报的正是这个）。
+- ⚠ **stream origin 坑（最花时间的一处）**：`bd://` 的 `stream_info_bluray.stream_origin`
+  是 `STREAM_ORIGIN_UNSAFE`（设备路径可指向任意文件），而 `check_origin()` 只允许
+  DIRECT/UNSAFE 来源打开它；demuxer 展开出来的条目默认是 **FS** 来源 → 被静默拒绝，
+  报 `No protocol handler found to open URL bd://...`（错误文案完全不提 origin）。
+  修法：`parse_bluray` 成功后把这些条目提升为 `STREAM_ORIGIN_DIRECT`（镜像已本地打开
+  并枚举成功，条目只是同一张盘里的 title，不是权限放宽）。
+  对照：客户端用 `loadfile bd://…` 手塞条目时是 DIRECT → 一直能用，所以这个坑只在
+  "让 mpv 自己展开"之后才暴露。
+
+**交互（用户 2026-10-26 定，含一次修正）**：ISO 与普通文件**同等对待**——
+展开成多个 title 条目后**按播放列表顺序播放**（首条播放、其余 append 排队），
+命令行 / 打开文件 / 打开文件夹 / 拖入 dropzone 四条入口一致。
+（最初实现是"列出来但不自动播放"，用户否掉："符合一般播放习惯，应该按顺序播放"。）
+⚠ 蓝光 3D 盘的第 1 个 title 常常是 0:00 的 logo/警告片，按顺序播放会瞬间跳过它
+再进第 2 个——这是"按顺序"的正常结果，不是 bug。
+
+**实现**：
+- `src/client/BlurayDisc.{h,cpp}`：进程内链 **libbluray**（meson 里
+  `dependency('libbluray', version: '>= 1.0.0')`；standard 用系统的、full 已捆
+  `libbluray.so.4`）。`bdisc::enumerate()` 只读 mpls/clpi 元数据（**不解码**），
+  返回 `{index, mpls, durationMs, chapterCount, clipCount, label}`。
+  ⚠ 命名空间不能叫 `bluray`——libbluray 头里有 `struct bluray`，同名会
+  "redeclared as different kind of entity"（实测）。
+- `PlayerViewModel::openFiles`：ISO **只把路径原样交给 mpv**（mpv 自己展开，见上），
+  顺带枚举一次只为**登记友好名**（`bdisc::registerLabel`，注册 `%05u` 与不补零两种
+  写法）；普通文件原样混排，首条 `loadfile` 播放、其余 `append`，`mode == 1` 全部
+  append。
+- **UI 入口必须能选到 ISO**：`FileDialog` 的媒体过滤器原本只有
+  `*.mp4 *.mkv …`，`.iso` 只能靠"All files (*)"才看得见 → 等于没有 UI 途径。
+  现在媒体过滤器含 `*.iso *.m2ts *.mts`，并单列 `Blu-ray images (*.iso)`。
+  ⚠ 用 **mpls 编号**而不是 title index：libbluray 的 title 索引随
+  `TITLES_*` 过滤条件变化，mpls 是盘上稳定标识。
+  **设备编进 URL（2026-10-26，解决了多盘混排）**：条目 URL 是
+  `bd://mpls/<n>//<绝对路径去掉前导 />`，即
+  `bd://mpls/3//home/zmq/视频/test.iso`。每条自带设备 → 同一播放列表里放**多张
+  不同 ISO** 也各自正确；URL 就是 mpv playlist 的 `filename` → **持久化免费成立**
+  （重启后条目自带设备，不再依赖全局设置）；`watch_later` 续播同理能定位回同一张盘。
+  ⚠ 两条硬约束（都实测过）：
+  ① **必须双斜杠**：`bd://mpls/<n>/<device>` 在第一个 `/` 处切分设备串，单斜杠会把
+     绝对路径的前导 `/` 吃掉（`/home/…` → `home/…`)；写 `///home/…` 又多一个斜杠，
+     所以生成时把路径自己的前导 `/` 去掉、固定用 `//` 作分隔。
+  ② **必须绝对路径**：相对路径会被解析成相对 root（`test.iso` → `/test.iso`）。
+  路径含中文/空格都验证可用（不需要 URL 编码）。
+  全局 `--bluray-device` 仍会设置一次作兜底（老持久化里的裸 `bd://mpls/N` 条目靠它）。
+- 播放列表面板显示名：`bdisc::labelFor("bd://mpls/5")` → `Title 6 · 01:18:30`
+  （进程级 QHash 在枚举时登记；未知 URL 回退 basename）。
+- **持久化**：`bluray-device` 是全局选项，重启后 bd:// 条目会打不开
+  （mpv 报 "No protocol handler found"）。所以把 ISO 路径存 `blurayDevice`
+  （设置写入后**立即 `settings_.sync()`**——被 SIGTERM 杀掉时不落盘，实测），
+  `restorePlaylist*` 在装载前先设回去。启动阶段同步写属性是安全的
+  （core 空闲、无 DR 竞争，见"GUI 线程不得同步调 mpv API"的例外条款）。
+- 枚举失败（非蓝光结构/损坏）→ 退回 `loadfile bd://`（mpv 默认播最长 title）。
+- CLI 输入也改走 `viewModel.openFiles`（原先直接 `mpv.loadFile`），否则
+  `vsr-player xxx.iso` 这条路径拿不到 ISO 特殊处理。
+
+**实测（本机 `test.iso`，20.6 GB）**：卷标 `CW3DBD_04`（3D 蓝光，`BDMV/STREAM/SSIF/`
+5 个 ssif），枚举 6 个 title（0:00 / 0:10 / 0:30 / 1:30 / 4:00 / **1:18:30**，
+主片 mpls=00003、16 章），`aacs=0`；点击主片 → `bd://mpls/3`、
+`h264 [High] 1920x1080`、`hwdec=nvdec`、`chapter-list/count=16`；重启后自动
+恢复 6 条 + 设备。普通文件与目录播放未受影响。
+
+**⚠ 该盘是双轨 MVC（蓝光 3D），只能播 base view（2D）**：SSIF 里两条视频 PID
+（0x1011 base + 0x1012 dependent/MVC），依赖视图的 NAL 是 type 15（subset SPS）
+与 type 20（slice extension）。FFmpeg 9.0.2 **不能解 MVC**（`sps_id 1 out of range`）。
+开源方案存在但**未合并**：[FFmpeg PR #24303](https://patchwork.ffmpeg.org/project/ffmpeg/patch/20260828142448.29D46269EF@ffbox0-bg.ffmpeg.org/)
+（Dom Cobley，2026-08，18 个补丁，`view_ids` 选视图），已知缺口正是我们要用的：
+**mpegts 里两视图分属不同 PID、未做关联**（蓝光 .ssif/.MTS 仍只解被 map 的那路），
+且 **hwaccel 下只解 base view**（必须软解）。真要支持 3D 需 backport 该系列 +
+自己做 SSIF 双 PID 关联，见后续评估。
+
 ### 桌面集成（2026-10-17）
 
 - `scripts/install.sh` 装应用菜单入口：入口内容 = **`data/vsr-player.desktop.in`**（单一事实源，中英 Name/Comment；`@EXEC@` 由脚本替换为安装后绝对路径，不依赖 PATH），图标 = `data/vsr-player.svg` + `.png` → hicolor `scalable`/`512x512`，之后 best-effort 刷新 `update-desktop-database`/`gtk-update-icon-cache`/`kbuildsycoca6`。打包脚本把 `data/` 放进 tarball 根（`build_release.sh` staging）。
@@ -319,6 +772,110 @@ Linux 桌面视频播放器：**NVIDIA VFX SDK 实时 AI 超分 / 插帧 / SDR�
 
 - **patch 方案**：`third_party/mpv`（纯净 0.41，只读基座）+ `src/mpv` 覆盖层（只含修改文件）。改 mpv 代码 = 改 `src/mpv/<同路径>` 后跑 `scripts/build_mpv.sh`（合并到 `build/mpv` 再 meson 构建）。
 - **构建陷阱**：`build_mpv.sh` 输出被 grep 过滤，编译失败看不到——确认最后一行 "Done"；别 `cd build` 后还用相对路径；系统库升级（FFmpeg/Qt/TRT）后必须全量重建（soname 变更直接启动失败）。
+- **standard / full 分层（2026-10-26 用户定，已实现）**：`build_release.sh` 两个变体
+  按"谁依赖系统库"切分，**不是按体积随意砍**：
+  - **standard（默认，6.3 MB tarball）**：只捆 `libmpv` + 光盘媒体栈（libcdio/libdvd/libbluray）
+    + 我们自己的 wayland 模块；**FFmpeg ×7、CUDA runtime（libnvrtc/builtins/cudart）、
+    Qt 一律用系统**。要求：系统 Qt ≥ 6.12、FFmpeg soname 与构建机一致（当前
+    `libavcodec.so.63` 等 7 个）、CUDA runtime 可解析（本机 `/opt/cuda`，已在
+    `/etc/ld.so.conf.d/cuda.conf` 里）。适合滚动发行版用户（系统本来就是新的）。
+  - **full（~70 MB）**：在 standard 之上再捆 FFmpeg ×7 + CUDA runtime + 最小 Qt
+    （库闭包 + 3 个平台插件 + wayland-* 插件 + `qml/QtQuick`(含 Controls/Dialogs/
+    Layouts/Shapes)+`qml/QtQml`）；用户侧只需驱动 + Vulkan loader + 基础 C 运行库。
+    面向 Qt < 6.12 / 老 FFmpeg / 无 CUDA toolkit 的发行版。**不对外分发**（按需构建）。
+  - 体积参考（实测）：standard 6.3 MB；带 ffmpeg+CUDA 的 55.8 MB 版本里
+    ffmpeg 占 12.6 MB、**libnvrtc 一个就占 36.9 MB（66%）**——真要瘦身先动 libnvrtc，
+    不是 ffmpeg。
+  - ⚠ 实现细节：① `4b` 的媒体栈发现必须**迭代到不动点**（`libmpv → libcdio/libdvdnav
+    → libdvdread` 两层链；standard 去掉 libavformat 后只看 libmpv 的 NEEDED 会漏
+    libdvdread，闭包自检直接失败）；② standard 的白名单要放行
+    `libav*|libsw*|libnvrtc|libcudart`（与 `libQt6` 同位）。
+  - **soname 不硬编码（2026-10-26）**：full 的 ffmpeg 收集列表改成从
+    `libmpv.so.2` 的 NEEDED 推导（`grep '^lib(av|sw)'`），ffmpeg 大版本升级后重建
+    自动跟随；standard 分支在构建日志里直接打印"要求系统提供: libavcodec.so.63 …"，
+    清单永远与构建机一致，不会出现"脚本写死 63、实机是 64"的静默错配。
+  - **装的时候就要能判断（install.sh [6/6] 预检）**：`ldd` 检查两个二进制，缺任何
+    NEEDED → **明确报错并 exit 1**（附三条出路：装对应系统库 / 换 full / 源码构建），
+    不再表现为"双击没反应"。另外强制校验 **libmpv 必须解析到本包的
+    `lib/vsr-player/`**：系统若装了 mpv（`/usr/lib/libmpv.so.2`），捆绑库缺失时加载器
+    会**静默回落**到它——程序能启动，但跑的是没有 `vf_vsr/vf_vfg/vf_rot` 和 libmpv vo
+    互操作的原版 mpv，表现为"能开但超分/插帧全没了且无任何报错"（实测：挪走捆绑
+    libmpv 后 `ldd` 解析到 `/usr/lib/libmpv.so.2`，并不报缺失）。
+  - **依赖盘点（2026-10-26，逐类定论）**：`libmpv.so.2` / `mpv-vsr` 共 ~55 条
+    `DT_NEEDED`，按"soname 会不会随上游跳"分四类：
+    | 类别 | 例子 | 处理 |
+    |---|---|---|
+    | 每次大版本必跳 | ffmpeg ×7（`.so.63/.12/.61/.7/.10`） | standard 去版本化 + 安装时链接 |
+    | 会跳但**不能**改 NEEDED | `libnvrtc.so.13`（符号版本命名空间就是 soname） | 保持带版本；靠系统，跳了由 compat 链接兜底 |
+    | soname=API 版本、跨版本会**静默**串 | `libplacebo.so.360`（`pl_log_create` 的 api_ver 在库里是 "historical, ignored currently"，`/usr/include/libplacebo/log.h:69`） | **两变体都捆**（含 shaderc/glslang/SPIRV-Tools/dovi 闭包） |
+    | 记成**绝对路径** | `libmujs.so`（无 SONAME → NEEDED 写成 `/usr/lib/libmujs.so`） | **两变体都捆** + `rewrite-needed.py` 改成 basename |
+    | soname 长期稳定 | glibc / libX11 / libwayland / libcuda / libvulkan / `libQt6*.so.6` | 用系统（标准做法） |
+    | soname 少见跳、无符号版本 | libass/libzimg/libluajit/librubberband/libuchardet/libsixel/libcaca | 用系统；真跳了 compat 链接兜底（它们无 VERNEED，改动安全） |
+  - **为什么必须这么处理（引用）**：`DT_NEEDED` 记的是库的 **SONAME**
+    （[Oracle: Recording a Shared Object Name](https://docs.oracle.com/cd/E19253-01/817-1984/6mhm7pl4u/index.html)、
+    [Debian policy：库由 SONAME 标识](http://www.debian.org/doc/debian-policy/policy.pdf)），
+    所以 `-lavcodec` / 无版本软链去链接**仍然**记 `.so.63`（实测 A/B）。真实世界的同类
+    事故：[zen-browser #14889](https://github.com/zen-browser/desktop/issues/14889)
+    （系统 ffmpeg 升 9.0 → `libavcodec.so.63` 不在白名单 → H.264 全挂）。
+    生态里的两种正解：**重编译对齐目标系统**（发行版做法，
+    [Debian #699648](https://alioth-lists.debian.net/pipermail/pkg-multimedia-maintainers/2013-February/031075.html)）
+    或**打包时改写 NEEDED/整包捆绑**（[Nix auto-patchelf](https://git.qyliss.net/nixlib/blame/pkgs/build-support/setup-hooks/auto-patchelf.sh)、
+    AppImage/manylinux 的 auditwheel）；发行版本身靠"soname 版本共存"（如 Ubuntu 的
+    [libplacebo360](https://packages.ubuntu.com/search?lang=zh-tw&keywords=libplacebo360) 包）让不同代共享。
+  - **发版规则与「组件版本表」（2026-10-26 用户定，已实现）**：
+    **标准版不带任何第三方依赖**（只带我们自己的产物：`libmpv.so.2` + 2 个
+    `libvsr-*.so`），**完整版（full）带全部依赖**（ffmpeg / CUDA / Qt / libplacebo
+    及其 shader 栈 / libmujs / 光盘栈）。每次打包由 `scripts/gen-components.sh`
+    从**产物本身**推导出 `COMPONENTS.md`（readelf NEEDED + 构建机解析结果，
+    不是手写清单，所以不会过期）：
+    - standard 那张表 = "**要求系统提供**"（61 条 NEEDED，逐条给 SONAME + 构建机
+      实际版本，如 `libavcodec.so` ← `libavcodec.so.63.1.102`）；
+    - full 那张表 = "**本包自带**"（27 个库逐条列版本/大小）+ 目标机额外要求；
+    - 两张表都带外部组件（驱动 / VFX SDK 版本 / Vulkan / Qt 要求）与排障命令。
+    `install.sh` 同时把 `COMPONENTS.md` 装到 `~/.local/share/vsr-player/`——
+    排障时让用户直接发这个文件即可。
+    ⚠ 连带改动：闭包自检对 standard 放宽成"构建机能解析即算系统提供"（否则按新
+    规则每个第三方库都会报未捆绑）；`soname-compat.sh` 加黑名单——**libplacebo /
+    libnvrtc / libcudart 禁止自动兼容链接**（跨 major 是静默不兼容，`ldd -r` 也
+    查不出来），缺了就明确报错并建议用 full。
+  - **跨 major 的可见性（2026-10-26）**：去版本化后 NEEDED 里没有 major 了，而
+    跨 ffmpeg major **没有 ABI 承诺**（符号齐全 ≠ 结构体/语义一致，`ldd -r` 查不出来）。
+    所以 `build_release.sh` 在 staging 里写 `lib/vsr-player/VSR-FFMPEG-MAJOR`
+    （从 `$MPV_DIST/_build/libmpv.so.2` 的 NEEDED 读，注意 staging 早于 `needed_of()`
+    定义 → 用 readelf 直读），`install.sh [6/6]` 拿它对照目标机实际
+    `libavcodec.so.<N>` 的 SONAME：一致打 `✅ FFmpeg 主版本匹配`，不一致打 ⚠ 并提示
+    "符号能对上不代表行为对，要确定性用 full 变体"（实测两支都验过）。
+  - **FFmpeg NEEDED 去版本化（2026-10-26，用户要求；standard 变体）**：
+    `scripts/rewrite-needed.py` 在打包时把 `lib/vsr-player/libmpv.so.2` 和 `mpv-vsr`
+    的 `DT_NEEDED` 从 `libavcodec.so.63` 改成 `libavcodec.so`（原地截短 .dynstr 里
+    那个字符串），安装时由 `soname-compat.sh` 按**目标机实际版本**建
+    `$LIB_DIR/libavcodec.so -> /usr/lib/libavcodec.so.<N>`。这样包本身不再钉任何
+    FFmpeg 版本。⚠ 三条实测结论：① 链接器无法绕过——`DT_NEEDED` 取库的 SONAME，
+    用 `-lavcodec`/无版本符号链接去链接仍记 `.so.63`（Oracle "Recording a Shared
+    Object Name" / Debian policy 同款规则）；② **`libnvrtc` 绝对不能改**：NVIDIA 的
+    符号版本命名空间就是 soname 本身，截短会连带改掉 version tag → 加载器报
+    `version 'libnvrtc.so' not found` + 所有 `nvrtc*` 符号 undefined（实测）；
+    FFmpeg 的 version tag 是 `LIBAVUTIL_61` 这类，与 soname 无关，且 NEEDED 与
+    VERNEED 的 `vna_file` 共用同一偏移、同步截短后仍一致 → 安全（`readelf -V` 可验）。
+    ③ 脚本内置 VERNEED 守卫：任何同时是 `vna_name` 的字符串一律跳过。
+  - **soname 兼容软链（2026-10-26，用户提的"软链就行"是对的）**：
+    `scripts/soname-compat.sh`（随 tarball 发布，install.sh [6/6] 在严格匹配失败后调用）：
+    缺 `libX.so.N` 时在 `$LIB_DIR`（RPATH 首位）建 `libX.so.N → 系统里同库的其它 major`
+    （候选来源 `ldconfig -p` + `LD_LIBRARY_PATH` 目录，取 major 最大者），然后
+    **`ldd -r` 验证没有 `undefined symbol`** 才保留；有缺符号就**回滚软链并 exit 1**。
+    要点：跨 major 是 ABI 赌注，但失败面是"加载器报 undefined symbol"（可检测），
+    而不是"启动成功、功能悄悄坏掉"。单测（合成 libfoo.so.1 → 只剩 .so.2）：
+    ABI 兼容时自动建链 + 程序正常；把新库的符号删掉后能抓到 `undefined symbol: foo`
+    并回滚。**这条让 standard 在系统 ffmpeg 大版本升级后不会直接死**——能兼容就自动补。
+  - **soname 绑定的本质**：ELF 的 NEEDED 记的是 so 名字，ffmpeg 跨大版本没有 ABI
+    兼容承诺 → **不捆就必然绑定某个 soname**。根治只有两条路：捆库（= full，
+    ffmpeg 12.6 MB 压缩）或静态链接 ffmpeg（Arch 不提供 .a，要自建 ffmpeg，
+    体积更大且每次 ffmpeg 安全更新都要重编）。因此**对外分发用 full**；
+    standard 的定位是"与构建机同源"的薄包。
+  - ⚠ dev 模式 `install.sh` 与 release 包**语义不同**：dev 把构建树产物装进 `~/.local`
+    （RUNPATH 指向 `build/mpv/_build`，依赖构建树）；release 包是
+    `$ORIGIN/../lib/vsr-player` 相对 RPATH，自洽。用户要"正式安装"就走
+    `build_release.sh` + 包内 `install.sh`。
 - 分发（2026-09 重构）：**源码构建为推荐路径**——`scripts/build-from-source.sh`（依赖自检→构建→安装→记录快照）；系统库升级后重跑同一条命令即可恢复。预编译 tarball 两个变体：`build_release.sh`（standard，需系统 Qt ≥6.12——Qt 二进制兼容是单向的，构建机 Qt 6.12.0 → 真实下限 6.12）与 `--variant=full`（捆绑最小 Qt：镜像发行版布局 `<prefix>/lib/qt6/{plugins,qml}` + Qt 库在 `<prefix>/lib/`，靠 Qt 自带相对 RUNPATH 解析，**免 patchelf**；`main.cpp` 在 QGuiApplication 前探测并设 `QT_PLUGIN_PATH`/`QML2_IMPORT_PATH`）。依赖收集 = 显式核心集 + 媒体栈动态发现（libcdio/libdvd/libbluray）+ **打包时闭包自检**（未捆绑且非白名单即失败）；`--engine=<已构建引擎>` 跳过 trtexec。
 - **依赖漂移检测**：`scripts/check-deps.sh [--record]` 记录构建时**系统库**快照（路径+mtime+size，排除仓库内自建产物——否则每次重建都误报），系统升级替换后提示重建；staging 目标用 `LD_LIBRARY_PATH` 模拟安装态解析。**soname 变更导致启动失败 → 跑 `build-from-source.sh` 重建**；用户侧排查见 README「故障排查」。
 - `scripts/install.sh`（用户端）：~/.local；VFX 从 **NVIDIA 官方索引 `pypi.nvidia.com`** 取 nvidia-vfx wheel（pypi.org 仅占位 sdist，2026-09 实测），curl 提取不调 pip 不改系统；VFX ~0.6GB 不随 tarball 分发（SLA）。⚠️ `set -euo pipefail` 下所有探测命令（nvidia-smi / pkg-config / curl 管道）必须 `|| true` 兜底，否则"未检测到"会变成"安装静默中止"（本项目实测踩过两次）。
@@ -328,6 +885,17 @@ Linux 桌面视频播放器：**NVIDIA VFX SDK 实时 AI 超分 / 插帧 / SDR�
 - GPU：RTX 5060 Ti（Blackwell sm_120）；驱动 615.78.08（2026-10-17 实测）；KWin Wayland 6.8.0（纯 Wayland，无 X11）。显示器 DP-3 = LG ULTRAFINE 27" 4K：EDID 含 ST2084、峰值 400 nit、基色≈DCI-P3（HDR 可在 KWin 里开）
 - Qt 6.12.0 / C++20 (GCC 13+) / Meson / FFmpeg 9.0 / TRT 11.2.1.2（pacman）
 - 测试文件：`input/`（catlove_720p.webm、Jellyfish 1080p h264/h265、goose_480p、heya 等）
+- **软件解码能力（2026-10-26 实测，i5-14600KF）**：`input/Fallout … 2160p … H265`（3840×1600
+  HEVC Main10 HDR，24fps）用 `--benchmark --scale off -- --hwdec=no` 跑出 **176 fps**
+  （约 7.3× 实时，CPU 约 5.6 核）；`ffmpeg -benchmark` 独立对照 **208 fps / 8.66×（≈7.4 核）**。
+  同文件 `--scale 2`（4K→7680×3200）46.8 fps、`--fruc 60` 168 fps、`--scale auto` 176.9 fps
+  （benchmark 无窗口 → auto 判定 1× 直通）、`--fruc 120`（4K→120fps）**168.3 fps**。
+  结论：**4K 软解在本机有 7–8× 余量 → 4K60（2.9×）甚至 4K120（1.4×）都不缺解码能力**，
+  4K 内容播放时 `scale=auto` 天然是 **1× 直通**（VSR 不参与，无额外成本），所以
+  "4K 播放"在本机**没有瓶颈**。（`--scale 2` 的 46.8 fps 只是人为构造的 4K→8K 压力测试，
+  真实场景不会出现——4K 已经到头了，没有上采样需求。）
+  所以 1080p×2 的 MVC（≈2×1080p H.264 ≈ 4.1 Mpx/帧）更是远在余量内，连假设的 4K MVC
+  （2×4K 解码 ≈ 88 fps 等效）在 CPU 侧都够 24fps。
 - 复现命令：`./build/src/client/vsr-player --fruc 60 input/goose_480p.webm`；RPC socket `/tmp/vsr-player.sock`
 - benchmark：`./build/src/client/vsr-player --benchmark [--scale off|auto|2|3|4] <video>`（无 UI，`all=no`，END_FILE 判定结束）；短文件启动开销会低估吞吐 ~35%，用 ≥100s 文件取稳态
 - 解码规则：AV1/H.264/HEVC/VC-1（wmv3/vc1）/MPEG-1/MPEG-2/MJPEG 一律 native decoder + CUDA hwaccel（get_format，mpv 显示为 `nvdec`）；**永不用 `*_cuvid`**（surface 管理 bug → 周期重复帧）。⚠️ 白名单补全史（2026-08-18，patch `src/mpv/video/decode/vd_lavc.c`）：默认 hwdec-codecs 漏 wmv3（软解 core 99.7% CPU + 掉帧，加后硬解 CPU 10% 0 掉帧）；实测 mpeg2video/mpeg1video/mjpeg 硬解生效已加入；mpeg4/h263/h263p 未加（mpeg4 的 mpv nvdec 路径 probe 失败打 error `decoding to AV_PIX_FMT_NONE` 回退软解，ffmpeg CLI 却可解——集成差异；h263 无测试文件）。
@@ -344,6 +912,80 @@ Linux 桌面视频播放器：**NVIDIA VFX SDK 实时 AI 超分 / 插帧 / SDR�
 - 关键文件：`src/mpv/video/filter/`（vf_vsr.c/vf_rife.c/vf_hwup.c/vsr_proc.c/rife_proc.c/rife_trt.cpp/cuda_shared.h/yuv_to_rgba.*）；`src/client/`（main.cpp/MpvController/PlayerViewModel/Video.cpp/Options.cpp/RpcServer.cpp）
 - 视觉问题数值化：`tests/verify_frames.sh`（baseline/test 两阶段 PSNR）——无 baseline 不改代码
 - **gdb 调试**（C/C++ 崩溃/卡死）：`gdb -batch -ex run -ex bt <binary>`（崩溃看调用栈；卡死看线程）——SIGSEGV→bt 定位非法访问；SIGABRT→bt+寄存器看 assert 条件；卡死→bt 看所有线程在等什么。通用排查流程见 `~/.dsh/AGENTS.md` 调试方法论
+
+## 待实现需求（用户已提出，**暂缓、不要动手**）
+
+### 单眼 2D 输出（vf_eye，**已实现 2026-10-27**）
+
+**需求**：不看 3D 时，主窗口按**单眼正常画幅**满屏播放，且**超分按单眼算**
+（VSR 输入 1920×1080，不是整帧 SBS）。
+
+#### 实现
+
+- **新滤镜 `vf_eye`**（`src/mpv/video/filter/vf_eye.c`，CUDA 零拷贝，仿 `vf_rot`）：
+  - 选项 `mode=off|left|right`、`layout=sbs|tab`、`half=0|1`；
+  - **全幅 = 1:1 拷贝裁半幅**；**半幅 = 裁半幅 + 沿 split 轴重采样回自然画幅**
+    （SBS 半 960×1080 → 1920×1080；TAB 半 1920×540 → 1920×1080）。
+    Y 用双线性（scale=1 时退化为精确拷贝），UV 用最近邻（NV12/P010 的 U/V 是
+    pair，不能把 pair 当整数插值——进位会串）；
+  - 输出帧尺寸 = **单眼画面**：`sbs 全 →(W/2,H)`、`sbs 半 →(W,H)`、
+    `tab 全 →(W,H/2)`、`tab 半 →(W,H)`；hwctx 按输出尺寸自建
+    （借用源尺寸会错乱/崩溃——`vf_rot` 的旧坑）；
+  - 运行期命令：`vf-command eye <off|left|right>` / `vf-command eye stereo <sbs|tab> <full|half>`。
+- **链上位置**：`hwup → eye → rot → vsr → truehdr → vfg`（`vfOption()` 的**三个 return
+  分支**都插入了——VFG 主链、`--fruc-order pre` 链、RIFE 链；漏一个就会出现
+  "eye 滤镜根本不在链上"而 vf-command 静默失败）。
+- **⚠ 半幅必须真拉伸，不能只设像素宽高比**：底栏「画面比例」用 mpv
+  `video-aspect-override`，一旦用户设了固定比例就会覆盖 p_w/p_h → 半幅被压扁；
+  而且 `vf_vsr` 的 `scale=auto` 按帧 w/h 算倍率（960×1080 会算偏大）。
+  烘焙成标准单眼帧后，比例/旋转/VSR auto/VFG 全按普通 2D 工作，客户端零特例。
+- **客户端**：`PlayerViewModel::setEyeState(mode, layout, half)`（layout/half < 0 =
+  保持当前值）；链串带 `@eye:eye:mode=…:layout=…:half=…` 初值；
+  `syncVfOptions()` 与 `replayStereoMap()` 都会重放（**链重建抹运行期 vf-command**）。
+- **UI**：右键菜单一级的「3D」小块 = 三条入口
+  **输出方式**（关闭 / 眼镜 3D / 单眼 2D）、**片源格式**（左右·全/半、上下·全/半）、
+  **输出选项**（左眼 / 右眼）；输出方式里第三项文案 = **2D 输出**（不是"单眼 2D"）。
+  ⚠ **三条目彼此独立，不做联动**（2026-10-27 用户明确要求）：
+  - 不加 `visibleWhen` 隐藏、不按模式切标签、不因某个选项自动改另一个选项；
+  - 输出选项只写"单眼输出用哪只眼"这一个独立状态 `eyePref`（0=左 1=右），
+    即使输出方式是"关闭"也能选（下次进单眼模式生效）；
+  - 唯一不可避免的耦合是"输出方式"本身是个三态开关：选眼镜 3D 会 `stereo.start`
+    （并 `stereo.stop()` 掉单眼）、选单眼 2D 会 `stereo.stop()` 并开单眼——
+    这是模式切换的语义，不是跨选项联动。
+  - 眼镜模式下的"交换眼序"只由 `K` 快捷键控制，不放进菜单。
+- **快捷键**：`J`/`L`（布局、全半）、`K`（眼镜=交换眼序 / 单眼=换眼）在**两种模式下都生效**；
+  `A`/`Shift+A` = 画面比例循环（列表照抄 mpv，见下）——3D 下也能用（戴眼镜直接调）。
+- **片源格式自动判定**：按**原生像素尺寸**（`video-params/w,h`，不能用 aspect——会被
+  override 污染）：宽/高 ≥ 2.6 → 左右·全；**≤ 1.25 → 上下·全**（1920×2160 = 0.889；
+  4:3 = 1.333 不会误判）；其余不猜（半幅无法从尺寸区分）。结果经**粘性属性**
+  `sourceLayoutHint` 给 QML（判定可能发生在 QML 就绪前，`Component.onCompleted` 补应用）。
+- **布局/全半是片源属性，但"不跨会话保留"**（用户 2026-10-27 定；要做按文件保存才会持久化）：
+  `StereoController` 构造时一律 `layout_=0 / half_=false`，**不读也不写** `stereoLayout`/
+  `stereoHalf`；`main.cpp` 启动时用独立 QSettings 一次性清掉旧版本遗留的这两个键
+  （放在最前面 + `sync()`：两个控制器各有 QSettings 缓存，从别处 remove 会被它们
+  随后的 sync 写回去）。打开文件时的自动判定仍然生效（只在内存里改）。
+  `start()` 也不重置（进 3D 不该清掉当前片源格式）。
+- **RPC**：`set-eye off|left|right [sbs|tab] [full|half]`、`get-eye`、
+  `get-video-size`（滤镜链输出帧尺寸，验证裁切/倍率不用截图）、
+  `get-source-format`（layout/half/eye/hint 状态）。
+
+#### 验证（headless，`--benchmark` + RPC，不需要上屏）
+
+| 操作 | `get-video-size` |
+|---|---|
+| SBS 3840×1080 整帧 | 3840×1080 |
+| `set-eye left sbs full` | **1920×1080** |
+| `set-eye right sbs full` | **1920×1080** |
+| `set-eye left tab full`（对 3840×1080） | **3840×540** |
+| `set-eye left sbs half` | **3840×1080**（拉回帧尺寸） |
+| TAB 1920×2160 + `set-eye left`（自动判定 layout=tab） | **1920×1080** |
+
+#### ⚠ 构建陷阱（踩过）
+
+`ninja -C build` **不会**重编 `src/mpv/` 的 overlay：libmpv 由 `scripts/build_mpv.sh`
+单独构建（输出 `build/mpv/_build/libmpv.so`，370 个目标）。改了滤镜必须：
+`./scripts/build_mpv.sh && ninja -C build`。否则表现为"代码明明改了、链里没这个滤镜"。
+另：新增 QML 文件必须登记进 `src/client/resources.qrc`，否则启动即失败（QML 类型不存在）。
 
 ## 相关文档
 

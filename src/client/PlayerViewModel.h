@@ -37,6 +37,12 @@ class PlayerViewModel : public QObject {
     Q_PROPERTY(int64_t duration READ duration NOTIFY durationChanged)
     // Overlay
     Q_PROPERTY(bool overlaysVisible READ overlaysVisible WRITE setOverlaysVisible NOTIFY overlaysVisibleChanged)
+    // 管线状态 OSD：2D 由 mpv 画进视频帧（osd-msg1）；3D 下 mpv 的 OSD 会被
+    // 合成器按左/右半幅切开（文字被劈成两半）→ 3D 改用 QML 覆盖层渲染
+    // osdText，mpv 侧强制 osd-level=0（见 osdPoll）。osdVisible 是同一个
+    // 单一状态，两种渲染器共用。
+    Q_PROPERTY(bool osdVisible READ osdVisible NOTIFY osdVisibleChanged)
+    Q_PROPERTY(QString osdText READ osdText NOTIFY osdTextChanged)
     // Audio
     Q_PROPERTY(double volume READ volume NOTIFY volumeChanged)
     // 无独立 mute 状态位：volume == 0 即静音（派生属性，volumeChanged 通知）
@@ -104,6 +110,13 @@ class PlayerViewModel : public QObject {
     Q_PROPERTY(double speed READ speed NOTIFY speedChanged)
     // Aspect ratio（mpv video-aspect-override：-1=auto, no=不覆盖, 或 16:9 等）
     Q_PROPERTY(QString aspect READ aspect NOTIFY aspectChanged)
+    // 单眼 2D 输出（0=off / 1=左眼 / 2=右眼）；运行期状态，不持久化。
+    Q_PROPERTY(int eyeMode READ eyeMode NOTIFY eyeModeChanged)
+    /// 片源格式自动判定（-1 未判定 / 0 左右 / 1 上下；目前只判"全幅"）。
+    Q_PROPERTY(int sourceLayoutHint READ sourceLayoutHint NOTIFY sourceLayoutHintChanged)
+    /// 单眼输出的眼别偏好（0=左 1=右）。与 eyeMode 分开：关闭状态下菜单也能
+    /// 选"左眼/右眼"，下次进单眼模式直接用这个偏好。
+    Q_PROPERTY(int eyePref READ eyePref NOTIFY eyePrefChanged)
     // Info（解码器状态分三个概念，别混用）：
     //  · hwDecoding        = **实际**是否在硬解（= mpv `hwdec-current` != no）
     //  · hwDecodeEnabled   = **用户偏好**（我们下发给 mpv 的 hwdec 开关；
@@ -245,6 +258,8 @@ public:
     /// 恢复上次播放列表（无 CLI 文件时调用）：首条 replace 开始播放，
     /// 其余 append，最后定位上次条目。
     void restorePlaylist();
+    /// 启动恢复 bd:// 条目前设回 bluray-device（见 .cpp 注释）。
+    void restoreBlurayDevice(const QStringList &files);
     /// 只恢复播放列表、**不载入任何媒体**（启动 idle，见 main.cpp）：
     /// 全部条目 append（无 current 条目 → mpv 不建解码/滤镜链、不 Load
     /// 引擎、不做续播 seek），仅把列表填进 UI 并记住"播放键该载入哪一条"。
@@ -315,6 +330,9 @@ public:
     bool frucMaxFpsAvailable() const;
     double speed() const        { return speed_.load(); }
     QString aspect() const      { return aspect_; }
+    int eyeMode() const         { return eyeMode_.load(); }
+    int sourceLayoutHint() const { return sourceLayoutHint_.load(); }
+    int eyePref() const         { return eyePref_.load(); }
     bool hwDecoding() const     { return hwDecoding_.load(); }
     bool hwDecodeEnabled() const   { return hwDecodeEnabled_.load(); }
     bool hwDecodeAvailable() const { return hwDecodeAvailable_.load(); }
@@ -353,6 +371,9 @@ public:
     int videoBitDepth() const { return videoBitDepth_.load(); }
     bool fullscreen() const     { return fullscreen_; }
     bool osdVisible() const     { return osdVisible_; }
+    QString osdText() const;   // 最近一次算出的 OSD 文本（互斥量保护）
+    /// 3D 是否激活：决定 OSD 走 mpv（2D）还是 QML 覆盖层（3D）。
+    void setStereo3DActive(bool v) { stereo3d_.store(v); }
     QVariantList trackList() const { return trackList_; }
     bool subVisible() const { return subVisible_; }
     double subDelay() const { return subDelay_; }
@@ -394,11 +415,35 @@ public slots:
     void stop();
     void seekAbsolute(int64_t ms);
     void seekRelative(int64_t offsetMs);
+
+    /// 3D 每眼映射（vf_vsr 的 auto 倍率按"眼视口 vs 眼源像素"算）。
+    /// active=false → 回 2D 公式。链重建后由 syncVfOptions 重放。
+    void setStereoMap(bool active, int layout, int half);
+    /// 单眼 2D 输出（vf_eye）：mode 0=off/1=left/2=right；layout 0=SBS/1=TAB；half 0/1。
+    /// 与 setStereoMap 分开：3D 关闭时 vf_vsr 走 2D 公式（stereoLayout_=-1），
+    /// 而 vf_eye 始终需要真实布局/尺寸。
+    void setEyeState(int mode, int layout, int half);
+    /// 只设置眼别偏好（0=左 1=右）；若单眼模式正在跑，同时切换显示的眼。
+    void setEyePref(int pref);
+    /// 链重建后重放 3D 每眼映射（事件线程调用 → 内部 async 命令）。
+    /// mpv 在解码器软硬切换/格式变化时会用**加载时的 vf 选项串**重建用户
+    /// 滤镜链，运行期 vf-command 设的值随之丢失（2026-10-26 实测：3D 倍率
+    /// 在软硬解码切换后回到 2D 公式）——所以 VIDEO_RECONFIG 时补推一次。
+    void replayStereoMap();
+
+    /// 快捷键调音量（↑/↓）。与滑杆的 setVolume 区分：只有本方法发
+    /// volumeNudged()——2D 下音量提示只对"按键"出现，UI 拖动不弹提示。
+    Q_INVOKABLE void nudgeVolume(double delta);
     void setVolume(double vol);
     void toggleMute();
     void toggleHwaccel();
     void setSpeed(double speed);
     Q_INVOKABLE void setAspect(const QString &v);
+    /// 触发一次瞬态提示（3D 与 2D 都会显示）。
+    Q_INVOKABLE void flashMessage(const QString &value) { emit messageFlashed(value); }
+    /// 播放列表里实际显示的条目名（面板 = PlaylistModel.display）。
+    Q_INVOKABLE QStringList playlistDisplayNames() const
+    { return playlistModel_.displayNames(); }
     void toggleFullscreen();
     void setOverlaysVisible(bool v);
     void toggleOsd();
@@ -491,6 +536,12 @@ signals:
     /// 直播/线性流被识别（主线程发出）：main.cpp 据此撤销"因历史进度而暂停"。
     void liveSourceDetected();
     void volumeChanged();
+    /// 快捷键调了音量（UI 滑杆/API 不发）——音量提示 OSD 的触发源。
+    void volumeNudged();
+    /// 播放列表由非空变为空（清空/删完）→ 画面置黑。
+    void playlistEmptied();
+    /// 快捷键快进/快退（拖进度条走 seekAbsolute，不发）——进度提示 OSD 的触发源。
+    void seekNudged();
     void qualityChanged();
     void vsrActiveChanged();
     void scaleChanged();
@@ -512,6 +563,15 @@ signals:
     void upHdrDebandingChanged();
     void speedChanged();
     void aspectChanged();
+    /// 瞬态提示（键位操作反馈：比例/布局等）。文案由 QML 组合（qsTr），
+    /// 这里只传值。"no" = 不覆盖。
+    void messageFlashed(const QString &value);
+    /// 片源格式自动判定结果的变化通知（-1 = 无结论 / 0 = 左右 / 1 = 上下）。
+    /// 用**粘性属性**而不是一次性信号：判定可能发生在 QML 就绪之前
+    ///（benchmark/命令行直接载入），QML 在 completed 时按 sourceLayoutHint 补应用。
+    void sourceLayoutHintChanged();
+    void eyePrefChanged();
+    void eyeModeChanged();
     void hwDecodingChanged();
     void hwDecodeEnabledChanged();
     void hwDecodeAvailableChanged();
@@ -524,6 +584,8 @@ signals:
     void videoHdrMetaChanged();   // 内容静态元数据变化（HDR10 描述需重下发）
     void fullscreenChanged();
     void osdVisibleChanged();
+    /// OSD 文本变化（事件线程发出；QML 在 GUI 线程接收 → 自动排队）
+    void osdTextChanged();
     void loopModeChanged();
     void trackListChanged();
     void subVisibleChanged();
@@ -556,6 +618,10 @@ private:
     /// restoredCurrentFile()（启动暂停判定）与 restorePlaylist()（实际装载）
     /// 共用——避免"哪一条会被播放"的规则分叉。
     QStringList restoredFiles(int *cur) const;
+    /// 上次播放列表的快照文件（m3u8，带 #EXTINF 标题）。
+    QString playlistSnapshotPath() const;
+    void writePlaylistSnapshot(const QStringList &files,
+                               const QStringList &titles, int cur) const;
     /// 段内统计重置（停止/暂停翻转/seek 完成/新文件）。主线程调用。
     void resetSegmentCounters(int64_t dropBase);
     /// 标记当前文件为直播/线性流（幂等）；why 仅用于日志。
@@ -627,6 +693,13 @@ private:
     double volume_ = 1.0;    // 初始与持久化默认一致（0.65 从未生效——观察器首轮回填覆盖）
     double savedVolume_ = 0.5;   // 静音前音量（toggle mute 恢复用；未静音过则 0.5）
     std::atomic<double> speed_{1.0};
+    void applyAspect();                          // 按 2D/3D 语义下发比例
+    void guessSourceFormat(int w, int h);        // 按原生像素尺寸猜片源格式
+    int sourceFormatLayout_ = -1;                // 上次判定结果（-1 = 未判定）
+    int sourceFormatHalf_ = 0;
+    std::atomic<int> sourceLayoutHint_{-1};      // QML 可见的判定结果
+    std::atomic<int> eyePref_{0};                // 单眼偏好：0=左 1=右
+    QString aspectApplied_ = QStringLiteral("no");  // 上次下发给 mpv 的值
     QString aspect_ = QStringLiteral("no");    // no=容器比例（mpv 0.41 -1 已弃用，no 等价无警告）
     std::atomic<bool> hwDecoding_{false};      // 实际（hwdec-current != no）
     std::atomic<bool> hwDecodeEnabled_{true};  // 用户偏好（我们下发的 hwdec 开关）
@@ -703,6 +776,9 @@ private:
     // 事件线程 idle 回调拉取 osdTextString 并推送（benchmark 同方案）；
     // 主线程 toggleOsd 只翻转 osdVisible_/osdLevel_（atomic）。
     std::atomic<bool> osdVisible_{false};
+    std::atomic<bool> stereo3d_{false};   // 3D 激活（OSD 改走 QML 覆盖层）
+    mutable std::mutex osdTextMu_;
+    QString osdText_;                     // 最近一次 OSD 文本（3D 的 QML 读）
     std::atomic<bool> osdLevel_{false};       // true=level 1（显示）
     bool osdLevelApplied_ = false;            // 事件线程专用：上次应用的 level
     std::string osdLastText_;                 // 事件线程专用：上次推送的文本
@@ -743,6 +819,12 @@ private:
     QString liveSourcePath_;
     bool    liveSourcePending_ = false;
     QString lastPath_;
+    /// 当前蓝光 ISO（mpv 的 bluray-device 是全局选项）：bd:// 条目离开它
+    /// 就打不开，所以随播放列表一起持久化，启动恢复前先设回去。
+    QString blurayDevice_;
+    /// 上一次 playlist 快照的条目数（判断"非空 → 空"的跃迁；启动时的
+    /// 初始空快照不能当成"用户清空了列表"）。
+    int playlistCount_ = 0;
     // 启动 idle：列表已排队但**没有 current 条目**（媒体未载入）。记住
     // 播放键第一次要载入的目标索引；同时供 playlist 观察器在 mpv 报
     // cur<0（无 current）时高亮"按播放将载入的那一条"。
@@ -773,5 +855,13 @@ private:
     int persistDeintMode_ = 0;    // 持久化反交错模式（initDeinterlace 用）
     std::atomic<int> deintMode_{0};   // 当前反交错模式（0/1/2；RPC 线程读）
     int persistRotMode_ = 0;          // 持久化旋转角度（0/90/270）
-    std::atomic<int> rotMode_{0};     // 当前旋转角度（RPC 线程读）
+    std::atomic<int> rotMode_{0};    // 当前旋转角度（RPC 线程读）
+    std::atomic<int> stereoLayout_{-1};  // 3D 布局（-1=非3D, 0=SBS, 1=上下；RPC 线程读）
+    std::atomic<int> stereoHalf_{0};     // 3D 全/半（0=全 1=半）
+    // 单眼 2D 输出（vf_eye）：0=off / 1=left / 2=right。运行期状态、不持久化。
+    // 布局/全半与 3D 共用语义（J/L），但**与 stereoLayout_ 分开存**：3D 关闭时
+    // stereoLayout_ 是 -1（vf_vsr 走 2D 公式），而 vf_eye 仍需要真实布局。
+    std::atomic<int> eyeMode_{0};
+    std::atomic<int> eyeLayout_{0};      // 0=SBS 1=上下
+    std::atomic<int> eyeHalf_{0};        // 0=全 1=半
 };

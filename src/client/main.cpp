@@ -10,7 +10,10 @@
 #include "Log.h"
 
 #include <QGuiApplication>
+#include <QKeyEvent>
 #include <QQuickView>
+#include <QShortcut>
+#include <QCloseEvent>
 #include <QQuickWindow>
 #include <QQuickGraphicsDevice>
 #include <QVulkanInstance>
@@ -36,6 +39,7 @@
 #include "MpvController.h"
 #include "PlayerViewModel.h"
 #include "RpcServer.h"
+#include "StereoController.h"
 #include "SessionIdle.h"
 #include "HdrOutput.h"
 
@@ -91,9 +95,219 @@ static bool expandInputs(const Options &opts, std::vector<std::string> *out) {
     return true;
 }
 
+
+// 3D 热键：H/J/K/L 在按键层做大小写无关拦截。
+// QKeySequence("J") 等价于 Shift+J（大写绑定在无 Shift 时无效）；
+// 事件过滤器在 QML 之前收到 KeyPress，用 event->key() 判断，不受大小写/CapsLock 影响。
+// 主窗口（presentation）：3D 时关闭 = 停止 3D 并把 3D 菜单复位为“不使用”，
+// 不退出应用；2D 时关闭 = 正常关闭主窗口（最后一个可见窗口 → 退出）。
+class StereoView : public QQuickView
+{
+public:
+    StereoController *stereo = nullptr;
+protected:
+    bool event(QEvent *e) override {
+        if (stereo && stereo->active() && e->type() == QEvent::KeyPress) {
+            auto *ke = static_cast<QKeyEvent *>(e);
+            if (ke->key() == Qt::Key_Escape)
+                return true;   // 3D 下 Esc 不参与全屏/窗口切换
+        }
+        return QQuickView::event(e);
+    }
+    void closeEvent(QCloseEvent *e) override {
+        if (stereo && stereo->active()) {
+            e->ignore();
+            stereo->stop();
+            MLOG_INFO("stereo: presentation closed -> 3D off");
+            return;
+        }
+        QQuickView::closeEvent(e);
+    }
+};
+
+// 桌面主窗口（controlView）：关闭 = 退出应用。
+class ControlView : public QQuickView
+{
+public:
+    StereoController *stereo = nullptr;
+protected:
+    bool event(QEvent *e) override {
+        if (stereo && stereo->active() && e->type() == QEvent::KeyPress) {
+            auto *ke = static_cast<QKeyEvent *>(e);
+            if (ke->key() == Qt::Key_Escape)
+                return true;
+        }
+        return QQuickView::event(e);
+    }
+    void closeEvent(QCloseEvent *e) override {
+        QQuickView::closeEvent(e);
+        QCoreApplication::quit();
+    }
+};
+
+class StereoKeyFilter : public QObject
+{
+    /// 画面比例循环：`A` 正序 / `Shift+A` 逆序，列表与顺序照抄 mpv
+    /// （third_party/mpv/etc/input.conf:156：
+    ///  cycle-values video-aspect-override "16:9" "4:3" "2.35:1" "no"）。
+    /// 当前值不在列表里时取第一个（= mpv cmd_cycle_values 的 "Picking default"）。
+    bool aspectKey(QEvent *event)
+    {
+        if (event->type() != QEvent::KeyPress)
+            return false;
+        auto *ke = static_cast<QKeyEvent *>(event);
+        if (ke->key() != Qt::Key_A)
+            return false;
+        if (ke->modifiers() & (Qt::ControlModifier | Qt::AltModifier | Qt::MetaModifier))
+            return false;
+        if (ke->isAutoRepeat())
+            return true;
+        static const char *kList[] = {"16:9", "4:3", "2.35:1", "no"};
+        const int n = int(sizeof(kList) / sizeof(kList[0]));
+        const QString cur = viewModel_->aspect();
+        int idx = -1;
+        for (int i = 0; i < n; i++)
+            if (cur == QLatin1String(kList[i])) idx = i;
+        const int dir = (ke->modifiers() & Qt::ShiftModifier) ? -1 : 1;
+        int next = (idx < 0) ? (dir > 0 ? 0 : n - 1) : (idx + dir + n) % n;
+        viewModel_->setAspect(QString::fromLatin1(kList[next]));
+        // 瞬态提示：值交给 QML 组合文案（3D 下显示"每眼比例"，2D/单眼显示"画面比例"）。
+        viewModel_->flashMessage(QString::fromLatin1(kList[next]));
+        return true;
+    }
+
+    /// 布局/全半变化后把新的源格式推给两个滤镜（vf_vsr 的 3D 倍率 + vf_eye）。
+    void syncStereoSource()
+    {
+        viewModel_->setStereoMap(stereo_->active(), stereo_->layout(),
+                                 stereo_->half() ? 1 : 0);
+        viewModel_->setEyeState(viewModel_->eyeMode(), stereo_->layout(),
+                                stereo_->half() ? 1 : 0);
+    }
+
+public:
+    StereoKeyFilter(StereoController *stereo, PlayerViewModel *vm, QObject *parent = nullptr)
+        : QObject(parent), stereo_(stereo), viewModel_(vm) {}
+
+protected:
+    bool eventFilter(QObject *watched, QEvent *event) override
+    {
+        Q_UNUSED(watched);
+        const bool stereo3d = stereo_->active();
+        const bool eyeMode = viewModel_->eyeMode() != 0;
+        // J/K/L 在「眼镜 3D」与「单眼 2D」下都生效（同一份布局/全半/眼别状态）；
+        // A（画面比例）任何时候都生效——2D 也要能修正片源比例。
+        if (!stereo3d && !eyeMode)
+            return aspectKey(event);
+        // 3D 下 Esc 一律吞掉：先吃 ShortcutOverride，再吃 KeyPress，
+        // 避免 QML Shortcut / 窗口层把全屏切回去。
+        if (event->type() == QEvent::ShortcutOverride) {
+            auto *ke = static_cast<QKeyEvent *>(event);
+            if (ke->key() == Qt::Key_Escape) {
+                event->accept();
+                return true;
+            }
+            return false;
+        }
+        if (event->type() != QEvent::KeyPress)
+            return false;
+        auto *ke = static_cast<QKeyEvent *>(event);
+        if (ke->key() == Qt::Key_Escape) {
+            MLOG_INFO("stereo key: Escape -> swallowed");
+            return true;
+        }
+        if (ke->modifiers() & (Qt::AltModifier | Qt::MetaModifier))
+            return false;
+
+        const bool repeat = ke->isAutoRepeat();
+        // 上一个/下一个：全局 Ctrl+← / Ctrl+→（2D 由 QML 处理，3D 在这里处理）。
+        if (ke->modifiers() & Qt::ControlModifier) {
+            if (ke->key() == Qt::Key_Left) {
+                if (!repeat) viewModel_->playlistPrev();
+                return true;
+            }
+            if (ke->key() == Qt::Key_Right) {
+                if (!repeat) viewModel_->playlistNext();
+                return true;
+            }
+            return false;
+        }
+        switch (ke->key()) {
+        case Qt::Key_A:
+            return aspectKey(event);
+        case Qt::Key_J:
+            if (repeat) return true;
+            stereo_->cycleLayout();
+            syncStereoSource();
+            return true;
+        case Qt::Key_K:
+            if (repeat) return true;
+            if (stereo3d) {
+                stereo_->swapEyes();
+            } else {
+                // 单眼模式：K = 换到另一只眼
+                viewModel_->setEyeState(viewModel_->eyeMode() == 2 ? 1 : 2,
+                                        stereo_->layout(), stereo_->half() ? 1 : 0);
+            }
+            return true;
+        case Qt::Key_L:
+            if (repeat) return true;
+            stereo_->toggleHalf();
+            syncStereoSource();
+            return true;
+        case Qt::Key_Tab:
+        case Qt::Key_Backtab:
+            // 3D 下用 Tab 切**管线状态 OSD**（调试用；H 仍切快捷键帮助面板）。
+            // 由本过滤器吃掉并返回 true —— 否则 QML 的 Tab Shortcut 会再
+            // 触发一次，两次 toggle 抵消（等于没反应）。
+            if (repeat) return true;
+            MLOG_INFO("stereo key: Tab -> toggle pipeline OSD");
+            viewModel_->toggleOsd();
+            return true;
+        case Qt::Key_H:
+            MLOG_INFO("stereo key: H -> toggle OSD");
+            if (repeat) return true;
+            stereo_->toggleHelp();
+            return true;
+        case Qt::Key_Space: if (repeat) return true; viewModel_->togglePlayPause(); return true;
+        case Qt::Key_Left:
+            viewModel_->seekRelative((ke->modifiers() & Qt::ShiftModifier) ? -10000 : -5000);
+            return true;
+        case Qt::Key_Right:
+            viewModel_->seekRelative((ke->modifiers() & Qt::ShiftModifier) ? 10000 : 5000);
+            return true;
+        case Qt::Key_Up:
+            viewModel_->nudgeVolume(0.05);
+            return true;
+        case Qt::Key_Down:
+            viewModel_->nudgeVolume(-0.05);
+            return true;
+        default: return false;
+        }
+    }
+
+private:
+    StereoController *stereo_;
+    PlayerViewModel *viewModel_;
+};
+
 int main(int argc, char *argv[]) {
     setbuf(stdout, nullptr); setbuf(stderr, nullptr);
     MLOG_INFO("=== vsr-player ===");
+    // 一次性迁移：旧版本把片源格式（布局/全半）持久化过；现在改为"不跨会话
+    // 保留"（用户 2026-10-27 定），启动时清掉遗留键。放在最前面、用独立
+    // QSettings + sync：PlayerViewModel/StereoController 各有自己的 QSettings
+    // 缓存，从别处 remove 会被它们随后的 sync 写回去。
+    {
+        QSettings legacy(QStringLiteral("vsr-player"), QStringLiteral("vsr-player"));
+        if (legacy.contains("stereoLayout") || legacy.contains("stereoHalf")) {
+            legacy.remove("stereoLayout");
+            legacy.remove("stereoHalf");
+            legacy.sync();
+            MLOG_INFO("settings: dropped legacy stereoLayout/stereoHalf "
+                      "(source format is no longer persisted)");
+        }
+    }
 
     // ── CLI ──────────────────────────────────────────────────────────────
     Options opts;
@@ -333,6 +547,8 @@ int main(int argc, char *argv[]) {
         viewModel.initDeinterlace(deintCli);
     }
     std::string vf = viewModel.vfOption();
+    // 链串打一行 INFO（排障用：filter 是否插上、顺序、初始选项）。
+    MLOG_INFO("vf chain: %s", vf.empty() ? "(none)" : vf.c_str());
 
     // ── mpv ─────────────────────────────────────────────────────────────
     // 启动策略（无参数启动 = 恢复上次列表）：
@@ -386,7 +602,12 @@ int main(int argc, char *argv[]) {
         if (!opts.benchmark)
             viewModel.applyPlaybackSettings();   // 音量/倍速/循环（观察器回填 UI）
 
-        QQuickView view;
+        // 3D OSD 原型：运行期状态（不持久化），在所选屏幕创建 3D OSD 窗口。
+        // 声明在 view 之前 → 析构晚于 view，QML 绑定不会访问已销毁对象。
+        StereoController stereo;
+
+        StereoView view;
+        view.stereo = &stereo;
         view.setVulkanInstance(&qtVi);
         view.setGraphicsDevice(QQuickGraphicsDevice::fromDeviceObjects(
             vk.physicalDevice(), vk.device(), vk.queueFamilyIndex()));
@@ -403,12 +624,15 @@ int main(int argc, char *argv[]) {
 
         view.rootContext()->setContextProperty("viewModel", &viewModel);
         view.rootContext()->setContextProperty("window", &view);
+        view.rootContext()->setContextProperty("stereo", &stereo);
+        stereo.setPlayerWindow(&view);
         // 图标字体：随项目分发（third_party，VSR_ICON_FONT 宏注入），
         // C++ 加载并注入 family 名。注意必须是 context property——
         // qmlcachegen AOT 编译不支持动态作用域（组件内引用父级未声明
         // 属性会解析失败 → font.family 空 → 图标乱码）。
         // 安装部署 fallback：<appdir>/../share/vsr-player/fonts/（install.sh
         // 复制字体到该位置；宏路径是开发机绝对路径，安装后不可用）。
+        QString iconFont;
         {
             QString fontPath = QString::fromLatin1(VSR_ICON_FONT);
             int fid = QFontDatabase::addApplicationFont(fontPath);
@@ -417,7 +641,7 @@ int main(int argc, char *argv[]) {
                          + "/../share/vsr-player/fonts/materialdesignicons-webfont.ttf";
                 fid = QFontDatabase::addApplicationFont(fontPath);
             }
-            QString iconFont = fid >= 0
+            iconFont = fid >= 0
                 ? QFontDatabase::applicationFontFamilies(fid).value(0)
                 : QString();
             view.rootContext()->setContextProperty("iconFont", iconFont);
@@ -425,6 +649,54 @@ int main(int argc, char *argv[]) {
                  fontPath.toUtf8().constData());
         }
         view.rootContext()->setContextProperty("benchmarkMode", opts.benchmark);
+        view.rootContext()->setContextProperty("controlMode", false);
+
+        // 桌面 control 窗口：同一份 main.qml，但 controlMode=true → 不创建
+        // Video，只保留 UI。3D 时主窗口（Video/VO）去眼镜屏，control 窗口
+        // 在主 UI 原来的屏幕/几何上显示，主 UI 不会消失。
+        ControlView controlView;
+        controlView.stereo = &stereo;
+        controlView.setColor("#202020");
+        controlView.setTitle("vsr-player");
+        controlView.setResizeMode(QQuickView::SizeRootObjectToView);
+        controlView.resize(1280, 720);
+        controlView.rootContext()->setContextProperty("viewModel", &viewModel);
+        controlView.rootContext()->setContextProperty("window", &controlView);
+        controlView.rootContext()->setContextProperty("stereo", &stereo);
+        controlView.rootContext()->setContextProperty("iconFont", iconFont);
+        controlView.rootContext()->setContextProperty("benchmarkMode", false);
+        controlView.rootContext()->setContextProperty("controlMode", true);
+        controlView.setSource(QUrl("qrc:/main.qml"));
+        if (controlView.status() != QQuickView::Ready) {
+            for (const auto &e : controlView.errors())
+                MLOG_ERR("control QML error: %s", e.toString().toUtf8().constData());
+            return 1;
+        }
+        stereo.setControlWindow(&controlView);
+        // 两个窗口都装：presentation 通常不接焦点；control 窗口失焦时也能收到，
+        // 且绕开 QML Shortcut 的大小写问题。
+        // 装在 QGuiApplication 上（不是两个 QQuickView 上）：3D 时焦点可能在
+        // presentation/control 任一窗口，应用级过滤器才能稳定收到所有按键。
+        auto *stereoKeyFilter = new StereoKeyFilter(&stereo, &viewModel, &app);
+        qApp->installEventFilter(stereoKeyFilter);
+
+
+
+        // QShortcut 作为第二道保险：J/K/L/H 都走应用级快捷键兜底。
+        auto addStereoShortcut = [&](Qt::Key key, auto action) {
+            auto *sc = new QShortcut(QKeySequence(key), &controlView);
+            sc->setContext(Qt::ApplicationShortcut);
+            sc->setAutoRepeat(false);
+            QObject::connect(sc, &QShortcut::activated, &controlView, [&stereo, action] {
+                if (stereo.active())
+                    action(stereo);
+            });
+        };
+
+        addStereoShortcut(Qt::Key_J, [](StereoController &s) { s.cycleLayout(); });
+        addStereoShortcut(Qt::Key_K, [](StereoController &s) { s.swapEyes(); });
+        addStereoShortcut(Qt::Key_L, [](StereoController &s) { s.toggleHalf(); });
+        MLOG_INFO("control window ready");
 
         view.setSource(QUrl("qrc:/main.qml"));
         if (view.status() != QQuickView::Ready) {
@@ -478,6 +750,17 @@ int main(int argc, char *argv[]) {
         hdr::installCapabilityProbe(&view);
         hdr::installSwapchainVerification(&view, initialMode);
         view.show();
+        // 主 UI 默认放到 primary 屏：KWin 会把新窗口放到当前活动输出，
+        // 用户鼠标在眼镜屏时主 UI/右键菜单会开到眼镜上。3D presentation
+        // 才是唯一应该去眼镜屏的窗口。
+        if (QScreen *primary = QGuiApplication::primaryScreen()) {
+            if (view.screen() != primary) {
+                MLOG_INFO("main window: move %s -> primary %s",
+                          view.screen() ? view.screen()->name().toUtf8().constData() : "?",
+                          primary->name().toUtf8().constData());
+                view.setScreen(primary);
+            }
+        }
         // QML 的 Qt.quit() → QQmlEngine::quit() signal——文档不保证默认
         // 连接，QQuickView 场景实测不退出（"退出无效"根因，2026-08-06）。
         // 显式连接：菜单"退出"/Ctrl+Q 走标准退出路径（exec 返回 → 清理）。
@@ -584,6 +867,26 @@ int main(int argc, char *argv[]) {
 
         // ── Wire Video ────────────────────────────────────────────────
         video->setMpvController(&mpv);
+        video->setStereoController(&stereo);
+        // 3D 映射变化（布局/眼序/全半）时立刻重绘当前帧；否则暂停时切 L
+        // 只会改 OSD 状态，画面要等下一帧才变。
+        QObject::connect(&stereo, &StereoController::stateChanged, video,
+                         [video, &viewModel, &stereo] {
+            video->update();
+            // VSR 的 auto 倍率在 3D 下要按"单眼视口 vs 单眼源像素"算
+            //（见 vf_vsr compute_adaptive_scale）——状态/布局/全半变化都推给滤镜。
+            viewModel.setStereoMap(stereo.active(), stereo.layout(),
+                                   stereo.half() ? 1 : 0);
+            // 3D 下 mpv 的 OSD 会被左右半幅切开 → 改由 QML 覆盖层渲染
+            viewModel.setStereo3DActive(stereo.active());
+        });
+        video->setSourceAspectProvider([&viewModel]() {
+            const int w = viewModel.videoWidth(), h = viewModel.videoHeight();
+            return (w > 0 && h > 0) ? double(w) / double(h) : 0.0;
+        });
+        video->setSourceSizeProvider([&viewModel]() {
+            return QSize(viewModel.videoWidth(), viewModel.videoHeight());
+        });
         video->setFrameRenderedCallback([&viewModel]() {
             viewModel.notifyFrameRendered();
         });
@@ -621,6 +924,12 @@ int main(int argc, char *argv[]) {
                              &app, syncSessionIdle);
             QObject::connect(&viewModel, &PlayerViewModel::overlaysVisibleChanged,
                              &app, syncSessionIdle);
+            // 播放列表被清空（全部移除 / 逐个删完）→ 合成输出纯黑。
+            // mpv idle 后不再产帧，rtImage 里留着最后一帧；渲染循环是
+            // "有新帧才画"，所以必须主动置黑（用户实测：画面停在最后状态）。
+            QObject::connect(&viewModel, &PlayerViewModel::playlistEmptied, video,
+                             [video] { video->setBlank(true); });
+
             // 直播/线性流：resume 不适用 → 撤销暂停，直接跟最新
             QObject::connect(&viewModel, &PlayerViewModel::liveSourceDetected,
                              &app, [&viewModel]() {
@@ -666,6 +975,9 @@ int main(int argc, char *argv[]) {
             // 修复曲目切换后播放/暂停 UI 卡在错误状态（path 清空窗口）。
             if (ev->event_id == MPV_EVENT_FILE_LOADED) {
                 viewModel.onFileLoadedFromEventThread();
+                // 有新文件真正载入 → 撤掉"无画面"置黑（清空列表时设的）
+                QMetaObject::invokeMethod(video, "setBlank", Qt::QueuedConnection,
+                                          Q_ARG(bool, false));
                 return;
             }
             // seek 完成（目标帧已显示）→ 连续快进/快退门控放行下一步。
@@ -673,6 +985,13 @@ int main(int argc, char *argv[]) {
             // 连续 seek 时完成通知可能被吞（拖进度条后方向键卡死的根因）。
             if (ev->event_id == MPV_EVENT_PLAYBACK_RESTART) {
                 viewModel.notePlaybackRestart();
+                return;
+            }
+            // 视频重配（解码器软硬切换、像素格式/尺寸变化）→ mpv 用**加载时的
+            // vf 选项串**重建用户滤镜链，运行期 vf-command 设的 3D 每眼映射会
+            // 丢（实测：3D auto 倍率在软硬解码切换后回到 2D 公式）→ 补推。
+            if (ev->event_id == MPV_EVENT_VIDEO_RECONFIG) {
+                viewModel.replayStereoMap();
                 return;
             }
             if (ev->event_id != MPV_EVENT_END_FILE)
@@ -718,7 +1037,7 @@ int main(int argc, char *argv[]) {
             // osdTextString 提供，与正常播放同一文本源）
             viewModel.showOsd();
         } else {
-            // 正常播放：初始隐藏（osd-level 0），Tab 切换显示
+            // 正常播放：初始隐藏（osd-level 0），H 切换显示
             mpv.setPropertyString("osd-level", "0");
         }
 
@@ -728,6 +1047,7 @@ int main(int argc, char *argv[]) {
             rpc.setMpv(&mpv);
             rpc.setViewModel(&viewModel);
             rpc.setWindow(&view);   // resize 命令（逐级 resize 压测）
+            rpc.setStereo(&stereo); // 3D OSD 原型（测试用 RPC）
             rpc.setQuitCallback([&app]() {
                 // Cross-thread: RPC thread → Qt event loop.
                 QMetaObject::invokeMethod(&app, &QCoreApplication::quit,
@@ -760,10 +1080,14 @@ int main(int argc, char *argv[]) {
             if (!entries.empty()) {
                 // CLI/播放列表（mpv 语义）：首条 replace 载入并播放，其余
                 // append（不打断首条；列表整体落进 mpv 的 playlist 属性，
-                // 后续由 UI/RPC 正常管理并照常持久化）
-                mpv.loadFile(entries[0].c_str());
-                for (size_t i = 1; i < entries.size(); i++)
-                    mpv.appendFile(entries[i].c_str());
+                // 后续由 UI/RPC 正常管理并照常持久化）。
+                // ⚠ 走 viewModel.openFiles 而不是直接 loadFile：蓝光 ISO 需要
+                // "像文件夹一样展开成 title 列表、且不自动播放"的特殊处理
+                //（见 PlayerViewModel::openFiles 的 ISO 分支）。
+                QStringList cliPaths;
+                cliPaths.reserve(int(entries.size()));
+                for (const auto &e : entries) cliPaths.append(QString::fromStdString(e));
+                viewModel.openFiles(cliPaths, 0);
                 MLOG_INFO("%zu inputs (first: %s), entering app.exec()",
                           entries.size(), entries[0].c_str());
             } else if (idleStart) {

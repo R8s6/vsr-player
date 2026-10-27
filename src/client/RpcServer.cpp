@@ -1,6 +1,10 @@
 #include "RpcServer.h"
 #include "MpvController.h"
 #include "PlayerViewModel.h"
+#include "StereoController.h"
+#include <QQuickView>
+#include <QQuickItem>
+#include <QImage>
 #include "FrucBackend.h"
 #include <mpv/client.h>
 #include <QMetaObject>
@@ -442,6 +446,305 @@ void RpcServer::handleLine(int fd, const std::string &line) {
             response = formatResponse(mpv_error_string(e));
         else
             response = formatResponse("success");
+    } else if (cmd == "vf-command") {
+        // 测试/诊断钩子：直通 mpv 的 vf-command（filter, cmd, [arg]）。
+        // 用途举例：`vf-command vsr stereo "tab full"` 强制造 3D 每眼映射，
+        // 在没有眼镜/多重屏时也能测 auto 倍率与 VSR 成本。
+        const char *argv[5] = {"vf-command", nullptr, nullptr, nullptr, nullptr};
+        if (!h) {
+            response = formatResponse("no mpv handle");
+        } else if (args.size() < 2) {
+            response = formatResponse("usage: vf-command <filter> <cmd> [arg]");
+        } else {
+            argv[1] = args[0].c_str();
+            argv[2] = args[1].c_str();
+            if (args.size() >= 3) argv[3] = args[2].c_str();
+            int e = mpv_command(h, argv);
+            response = e < 0 ? formatResponse(mpv_error_string(e))
+                             : formatResponse("success");
+        }
+    } else if (cmd == "toggle-osd") {
+        // 测试钩子：切管线状态 OSD（= Tab 键的效果；不注入按键）。
+        // 2D 走 mpv osd-msg1，3D 走 QML 覆盖层（见 PlayerViewModel::osdPoll）。
+        if (!vm) {
+            response = formatResponse("no view model");
+        } else {
+            QMetaObject::invokeMethod(vm, "toggleOsd", Qt::QueuedConnection);
+            response = formatResponse("success");
+        }
+    } else if (cmd == "get-source-format") {
+        // 片源格式状态（排障/验证自动判定用）：layout 0=左右 1=上下；half 0/1；
+        // eyeMode 0=off 1=左 2=右；hint = 自动判定结果（-1 未判定）。
+        if (!vm || !stereo_) {
+            response = formatResponse("no view model");
+        } else {
+            char buf[96];
+            snprintf(buf, sizeof buf, "layout=%d half=%d eye=%d pref=%d hint=%d",
+                     stereo_->layout(), stereo_->half() ? 1 : 0,
+                     vm->property("eyeMode").toInt(),
+                     vm->property("eyePref").toInt(),
+                     vm->property("sourceLayoutHint").toInt());
+            response = formatResponse("success", "\"" + std::string(buf) + "\"");
+        }
+    } else if (cmd == "set-eye-pref") {
+        // 输出选项 = 单眼输出用哪只眼（独立状态，不改输出方式）。
+        // 用法：set-eye-pref left|right
+        if (!vm) {
+            response = formatResponse("no view model");
+        } else if (args.size() < 1 || (args[0] != "left" && args[0] != "right")) {
+            response = formatResponse("usage: set-eye-pref left|right");
+        } else {
+            QMetaObject::invokeMethod(vm, "setEyePref", Qt::QueuedConnection,
+                                      Q_ARG(int, args[0] == "right" ? 1 : 0));
+            response = formatResponse("success");
+        }
+    } else if (cmd == "get-video-size") {
+        // 滤镜链输出帧尺寸（video-out-params/w×h）—— 验证 vf_eye 裁切/拉伸、
+        // VSR 倍率等改动时不用截图，直接读尺寸。
+        if (!mpv_) {
+            response = formatResponse("no mpv");
+        } else {
+            int64_t w = 0, h = 0;
+            mpv_get_property(mpv_->handle(), "video-out-params/w", MPV_FORMAT_INT64, &w);
+            mpv_get_property(mpv_->handle(), "video-out-params/h", MPV_FORMAT_INT64, &h);
+            char buf[64];
+            snprintf(buf, sizeof buf, "%lldx%lld", (long long)w, (long long)h);
+            response = formatResponse("success", "\"" + std::string(buf) + "\"");
+        }
+    } else if (cmd == "set-eye") {
+        // 测试钩子：单眼 2D 输出（vf_eye）。
+        // 用法：set-eye off|left|right [sbs|tab] [full|half]
+        if (!vm) {
+            response = formatResponse("no view model");
+        } else if (args.empty()) {
+            response = formatResponse("usage: set-eye off|left|right [sbs|tab] [full|half]");
+        } else {
+            int mode = -1;
+            if (args[0] == "off") mode = 0;
+            else if (args[0] == "left") mode = 1;
+            else if (args[0] == "right") mode = 2;
+            if (mode < 0) {
+                response = formatResponse("usage: set-eye off|left|right [sbs|tab] [full|half]");
+            } else {
+                // 省略布局/尺寸时保持当前值（-1），便于只切眼别
+                int layout = -1, half = -1;
+                if (args.size() > 1)
+                    layout = (args[1] == "tab") ? 1 : (args[1] == "sbs" ? 0 : -1);
+                if (args.size() > 2)
+                    half = (args[2] == "half") ? 1 : (args[2] == "full" ? 0 : -1);
+                QMetaObject::invokeMethod(vm, "setEyeState", Qt::QueuedConnection,
+                                          Q_ARG(int, mode), Q_ARG(int, layout),
+                                          Q_ARG(int, half));
+                response = formatResponse("success");
+            }
+        }
+    } else if (cmd == "get-eye") {
+        if (!vm) {
+            response = formatResponse("no view model");
+        } else {
+            const int m = vm->property("eyeMode").toInt();
+            static const char *kNames[] = {"off", "left", "right"};
+            response = formatResponse("success",
+                                      "\"" + std::string(kNames[m < 0 || m > 2 ? 0 : m]) + "\"");
+        }
+    } else if (cmd == "set-stereo-map") {
+        // 测试钩子：设置 3D 每眼映射（等价于真 3D 状态下客户端推给 vf_vsr 的值）。
+        // 走 viewModel 同一入口，因此会被 syncVfOptions 重放（不会被链重建抹掉）——
+        // 没接眼镜时也能测 3D 下的 VSR auto 倍率与成本。
+        // 用法：set-stereo-map off | set-stereo-map <sbs|tab> <full|half>
+        if (!vm) {
+            response = formatResponse("no view model");
+        } else if (args.empty()) {
+            response = formatResponse("usage: set-stereo-map off|<sbs|tab> <full|half>");
+        } else if (args[0] == "off") {
+            QMetaObject::invokeMethod(vm, "setStereoMap", Qt::QueuedConnection,
+                                      Q_ARG(bool, false), Q_ARG(int, 0), Q_ARG(int, 0));
+            response = formatResponse("success");
+        } else if (args.size() >= 2 &&
+                   (args[0] == "sbs" || args[0] == "tab") &&
+                   (args[1] == "full" || args[1] == "half")) {
+            QMetaObject::invokeMethod(vm, "setStereoMap", Qt::QueuedConnection,
+                                      Q_ARG(bool, true),
+                                      Q_ARG(int, args[0] == "tab" ? 1 : 0),
+                                      Q_ARG(int, args[1] == "half" ? 1 : 0));
+            response = formatResponse("success");
+        } else {
+            response = formatResponse("usage: set-stereo-map off|<sbs|tab> <full|half>");
+        }
+    } else if (cmd == "stereo-start") {
+        // 3D OSD 原型：stereo-start <mode 1|2> <screen index>（测试用；
+        // 正常入口是右键菜单 3D → 选项 → 选择显示器）。
+        if (!stereo_) {
+            response = formatResponse("no stereo controller");
+        } else if (args.size() < 2) {
+            response = formatResponse("usage: stereo-start <1|2> <screen-index>");
+        } else {
+            char *e1 = nullptr, *e2 = nullptr;
+            long mode = strtol(args[0].c_str(), &e1, 10);
+            long idx  = strtol(args[1].c_str(), &e2, 10);
+            if (!e1 || *e1 || !e2 || *e2 || mode != 1 || idx < 0) {
+                response = formatResponse("invalid mode/screen (mode 1, index>=0)");
+            } else {
+                QMetaObject::invokeMethod(stereo_, "start", Qt::QueuedConnection,
+                                          Q_ARG(int, (int)mode),
+                                          Q_ARG(int, (int)idx));
+                response = formatResponse("success");
+            }
+        }
+    } else if (cmd == "stereo-stop") {
+        if (!stereo_) {
+            response = formatResponse("no stereo controller");
+        } else {
+            QMetaObject::invokeMethod(stereo_, "stop", Qt::QueuedConnection);
+            response = formatResponse("success");
+        }
+    } else if (cmd == "stereo-help") {
+        if (!stereo_) {
+            response = formatResponse("no stereo controller");
+        } else if (args.empty()) {
+            response = formatResponse("missing value (0|1)");
+        } else {
+            bool v = args[0] == "1" || args[0] == "yes" || args[0] == "true";
+            QMetaObject::invokeMethod(stereo_, "setHelpVisible", Qt::QueuedConnection,
+                                      Q_ARG(bool, v));
+            response = formatResponse("success");
+        }
+    } else if (cmd == "open-menu") {
+        // 测试用：在窗口内 (x,y) 打开右键菜单（正常入口 = 右键）。
+        // 用于截图核对菜单排版/分组（尤其二级面板的分组标题与勾选态）。
+        auto *qv = qobject_cast<QQuickView *>(win_);
+        if (!qv || !qv->rootObject()) {
+            response = formatResponse("no window");
+        } else if (args.size() < 2) {
+            response = formatResponse("usage: open-menu <x> <y> [submenu-index]");
+        } else {
+            const int x = atoi(args[0].c_str());
+            const int y = atoi(args[1].c_str());
+            const int sub = args.size() >= 3 ? atoi(args[2].c_str()) : -1;
+            QQuickItem *rootItem = qv->rootObject();
+            QMetaObject::invokeMethod(rootItem, [rootItem, x, y, sub]() {
+                QMetaObject::invokeMethod(rootItem, "openMenuAt",
+                                          Q_ARG(QVariant, QVariant(x)),
+                                          Q_ARG(QVariant, QVariant(y)),
+                                          Q_ARG(QVariant, QVariant(sub)));
+            });
+            response = formatResponse("success");
+        }
+    } else if (cmd == "stereo-picker") {
+        // 测试用：打开 3D 选择器（正常入口 = 右键菜单 → 3D → 3D片源/2D转3D）
+        auto *qv = qobject_cast<QQuickView *>(win_);
+        if (!qv || !qv->rootObject()) {
+            response = formatResponse("no window");
+        } else if (args.empty()) {
+            response = formatResponse("missing mode (1|2)");
+        } else {
+            int mode = atoi(args[0].c_str());
+            QQuickItem *rootItem = qv->rootObject();
+            QMetaObject::invokeMethod(rootItem, [rootItem, mode]() {
+                rootItem->setProperty("stereoPickerMode", mode);
+                QMetaObject::invokeMethod(rootItem, "openStereoPicker", Qt::QueuedConnection);
+            }, Qt::QueuedConnection);
+            response = formatResponse("success");
+        }
+    } else if (cmd == "get-playlist") {
+        // 播放列表条目（filename + title）——验证蓝光 ISO 展开后的命名等。
+        if (!mpv_) {
+            response = formatResponse("no mpv");
+        } else {
+            mpv_node node;
+            std::string out;
+            if (mpv_get_property(mpv_->handle(), "playlist", MPV_FORMAT_NODE, &node) >= 0) {
+                if (node.format == MPV_FORMAT_NODE_ARRAY) {
+                    for (int i = 0; i < node.u.list->num; i++) {
+                        mpv_node *e = &node.u.list->values[i];
+                        if (e->format != MPV_FORMAT_NODE_MAP) continue;
+                        std::string fn, ti;
+                        bool cur = false, playing = false;
+                        for (int j = 0; j < e->u.list->num; j++) {
+                            const char *k = e->u.list->keys[j];
+                            mpv_node *v = &e->u.list->values[j];
+                            if (!strcmp(k, "filename") && v->format == MPV_FORMAT_STRING)
+                                fn = v->u.string;
+                            else if (!strcmp(k, "title") && v->format == MPV_FORMAT_STRING)
+                                ti = v->u.string;
+                            else if (!strcmp(k, "current") && v->format == MPV_FORMAT_FLAG)
+                                cur = v->u.flag != 0;
+                            else if (!strcmp(k, "playing") && v->format == MPV_FORMAT_FLAG)
+                                playing = v->u.flag != 0;
+                        }
+                        out += (cur ? "*" : " ") + std::string(playing ? "P" : " ");
+                        out += std::to_string(i) + ": title='" + ti + "' file='" + fn + "'\n";
+                    }
+                }
+                mpv_free_node_contents(&node);
+            }
+            if (vm) {
+                const QStringList names = vm->playlistDisplayNames();
+                out += "-- model.display --\n";
+                for (int i = 0; i < names.size(); i++)
+                    out += std::to_string(i) + ": '" + names[i].toStdString() + "'\n";
+            }
+            response = formatResponse("success", "\"" + jsonEscape(out) + "\"");
+        }
+    } else if (cmd == "grab-window") {
+        // 测试用：抓主窗口（锁屏/无眼镜时检查 UI）
+        if (!win_) {
+            response = formatResponse("no window");
+        } else if (args.empty()) {
+            response = formatResponse("missing path");
+        } else {
+            QQuickWindow *win = win_;
+            QString path = QString::fromStdString(args[0]);
+            QMetaObject::invokeMethod(win, [win, path]() {
+                QImage img = win->grabWindow();
+                if (!img.isNull())
+                    img.save(path);
+            }, Qt::QueuedConnection);
+            response = formatResponse("success");
+        }
+    } else if (cmd == "nudge-volume") {
+        // 模拟快捷键调音量（触发音量提示 OSD；与 set_property volume 区分）
+        if (!vm) {
+            response = formatResponse("no view model");
+        } else if (args.empty()) {
+            response = formatResponse("usage: nudge-volume <delta e.g. 0.05>");
+        } else {
+            char *end = nullptr;
+            double d = strtod(args[0].c_str(), &end);
+            if (end == args[0].c_str() || *end != '\0' || !std::isfinite(d))
+                response = formatResponse("invalid delta");
+            else {
+                QMetaObject::invokeMethod(vm, "nudgeVolume", Qt::QueuedConnection,
+                                          Q_ARG(double, d));
+                response = formatResponse("success");
+            }
+        }
+    } else if (cmd == "get-stereo") {
+        // 合成映射数据（不截图判断满不满屏；与日志 `stereo map:` 同源）
+        if (!stereo_) {
+            response = formatResponse("no stereo controller");
+        } else {
+            const std::string m = stereo_->mapJson().toStdString();
+            response = m.empty() ? formatResponse("no map yet")
+                                 : formatResponse("success", "\"" + jsonEscape(m) + "\"");
+        }
+    } else if (cmd == "stereo-cycle") {
+        if (!stereo_) {
+            response = formatResponse("no stereo controller");
+        } else if (args.empty()) {
+            response = formatResponse("missing value (layout|swap|fit)");
+        } else if (args[0] == "layout") {
+            QMetaObject::invokeMethod(stereo_, "cycleLayout", Qt::QueuedConnection);
+            response = formatResponse("success");
+        } else if (args[0] == "swap") {
+            QMetaObject::invokeMethod(stereo_, "swapEyes", Qt::QueuedConnection);
+            response = formatResponse("success");
+        } else if (args[0] == "half") {
+            QMetaObject::invokeMethod(stereo_, "toggleHalf", Qt::QueuedConnection);
+            response = formatResponse("success");
+        } else {
+            response = formatResponse("invalid value (layout|swap|half)");
+        }
     } else {
         response = formatResponse("unknown command");
     }

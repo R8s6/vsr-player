@@ -1,4 +1,5 @@
 #include "PlayerViewModel.h"
+#include "BlurayDisc.h"
 #include <QDir>
 #include <QFileInfo>
 #include <QProcess>
@@ -14,6 +15,9 @@
 #include <QFileInfo>
 #include <QDir>
 #include <QSet>
+#include <QSaveFile>
+#include <QStandardPaths>
+#include <QTextStream>
 #include <QLocale>
 
 #include <cstdio>
@@ -202,6 +206,7 @@ void PlayerViewModel::attach(MpvController *mpv) {
 
     mpv_->observeProperty("playlist", MPV_FORMAT_NODE, [this, post] {
         QStringList files;
+        QStringList titles;
         int cur = -1;
         mpv_node node;
         if (mpv_get_property(mpv_->handle(), "playlist", MPV_FORMAT_NODE,
@@ -211,17 +216,20 @@ void PlayerViewModel::attach(MpvController *mpv) {
                     mpv_node *entry = &node.u.list->values[i];
                     if (entry->format != MPV_FORMAT_NODE_MAP)
                         continue;
-                    QString fn;
+                    QString fn, ti;
                     for (int j = 0; j < entry->u.list->num; j++) {
                         const char *k = entry->u.list->keys[j];
                         mpv_node *v = &entry->u.list->values[j];
                         if (!strcmp(k, "filename") && v->format == MPV_FORMAT_STRING)
                             fn = v->u.string;
+                        else if (!strcmp(k, "title") && v->format == MPV_FORMAT_STRING)
+                            ti = v->u.string;
                         else if (!strcmp(k, "current") && v->format == MPV_FORMAT_FLAG
                                  && v->u.flag)
                             cur = i;
                     }
                     files.append(fn);
+                    titles.append(ti);
                 }
             }
             mpv_free_node_contents(&node);
@@ -229,7 +237,7 @@ void PlayerViewModel::attach(MpvController *mpv) {
         // 全量快照 → PlaylistModel 前缀 diff 增量生效（切歌只刷
         // current 行高亮，不重建列表——QStringList 属性全量 reset
         // 是大列表卡顿主因）
-        post([this, files, cur] {
+        post([this, files, titles, cur] {
             // 缓存的 current 索引（= mpv playlist-pos，-1 = 无当前条目）。
             // "移除当前条目"用它，避免在 GUI 线程同步读 playlist-pos
             //（同 path 观察器注释：同步 mpv API 会和 DR 帧分配互锁）。
@@ -238,13 +246,21 @@ void PlayerViewModel::attach(MpvController *mpv) {
             // 否则 play() 的 !fileLoaded_ 分支会走 resumeLastPath()，把刚被
             // 移除的文件 append-play **重新加回列表**（用户实测："删了当前
             // 文件，画面只是停住，再点播放又回来了"）。
-            if (files.isEmpty()) {
+            // ⚠ 只在**非空 → 空**的这次跃迁上清（2026-10-26 修）：
+            // 启动 idle 时（restorePlaylistIdle 已经把 lastPath_/idlePlayIndex_
+            // 设好）playlist 观察器会先投递一次**初始空快照**，无条件清空会把
+            // 刚设好的重播目标抹掉 → "重启后点播放无反应"，且取决于事件与
+            // 启动代码的先后，表现为**概率性**（用户实测）。
+            const bool hadEntries = playlistCount_ > 0;
+            playlistCount_ = files.size();
+            if (files.isEmpty() && hadEntries) {
                 lastPath_.clear();
                 idlePlayIndex_ = -1;
                 if (!videoInfo_.isEmpty()) {   // 标题别停在已移除的文件上
                     videoInfo_.clear();
                     emit videoInfoChanged();
                 }
+                emit playlistEmptied();        // → Video 置黑（见 setBlank）
             }
             // 启动 idle：列表只有排队条目、mpv 无 current（cur<0）→ 用记录的
             // 目标索引高亮"按播放将载入的那一条"（否则列表看起来没有选中项）。
@@ -252,10 +268,11 @@ void PlayerViewModel::attach(MpvController *mpv) {
             int shown = cur;
             if (shown < 0 && idlePlayIndex_ >= 0 && idlePlayIndex_ < files.size())
                 shown = idlePlayIndex_;
-            playlistModel_.setSnapshot(files, shown);
-            // 持久化上次播放列表（启动 restorePlaylist 用；清空也写）
-            saveSettings("playlist", files);
-            saveSettings("playlistCurrent", shown);
+            playlistModel_.setSnapshot(files, shown, titles);
+            // 持久化上次播放列表：写**m3u8 快照**（带 #EXTINF 标题），恢复时
+            // 交给 mpv 的 `loadlist` —— 条目名由 demux_playlist 解析出来，
+            // 客户端不再自己维护"路径→名字"表（蓝光 title 因此天然保留）。
+            writePlaylistSnapshot(files, titles, shown);
         });
     });
 
@@ -357,6 +374,7 @@ void PlayerViewModel::attach(MpvController *mpv) {
                 if (videoWidth_ != w || videoHeight_ != h) {
                     videoWidth_.store(w); videoHeight_.store(h);
                     emit osdDataChanged();
+                    guessSourceFormat(w, h);
                 }
                 if (decoderPixelFormat_ != QString::fromStdString(pix)) {
                     decoderPixelFormat_ = QString::fromStdString(pix);
@@ -780,7 +798,16 @@ void PlayerViewModel::applyPlaybackSettings() {
     setVolume(settings_.value("volume", 1.0).toDouble());
     setSpeed(settings_.value("speed", 1.0).toDouble());
     setLoopMode(settings_.value("loopMode", 0).toInt());
-    setAspect(settings_.value("aspect", QStringLiteral("no")).toString());
+    {
+        // 存储值只保留 mpv 的四个档位（16:9 / 4:3 / 2.35:1 / no）；旧版本存过
+        // 16:10 之类已移除的值 → 退回 no（否则弹窗里没有任何一项是高亮的）。
+        QString a = settings_.value("aspect", QStringLiteral("no")).toString();
+        if (a != "16:9" && a != "4:3" && a != "2.35:1" && a != "no") {
+            MLOG_INFO("aspect: unsupported legacy value '%s' -> no", a.toStdString().c_str());
+            a = QStringLiteral("no");
+        }
+        setAspect(a);
+    }
     applyDeinterlace();   // mpv 选项（非 vf）——链重建后也由 FILE_LOADED 重放
 
     // 解码偏好初值 = mpv 当前的 `hwdec` 选项（含 `-- --hwdec=no` 透传）。
@@ -796,17 +823,40 @@ void PlayerViewModel::applyPlaybackSettings() {
     refreshHwDecodeAvailability();
 }
 
+/// bd:// 条目依赖全局选项 bluray-device —— 启动恢复前必须先设回去，
+/// 否则 mpv 会去开"默认光驱"（不存在）→ 条目全部打不开。
+void PlayerViewModel::restoreBlurayDevice(const QStringList &files) {
+    if (!mpv_) return;
+    int bdCount = 0;
+    for (const QString &f : files)
+        if (f.startsWith("bd://")) bdCount++;
+    if (!bdCount) return;
+    const QString dev = settings_.value("blurayDevice").toString();
+    if (dev.isEmpty()) return;
+    blurayDevice_ = dev;
+    // 启动阶段（core 空闲、无解码线程等 DR）同步写安全，见 AGENTS 的
+    // "GUI 线程不得同步调 mpv API" 例外条款。
+    mpv_->setPropertyString("bluray-device", dev.toStdString());
+    MLOG_INFO("bluray: restored device %s for %d bd:// entr(ies)",
+              qUtf8Printable(QFileInfo(dev).fileName()), bdCount);
+}
+
 void PlayerViewModel::restorePlaylist() {
     if (!mpv_) return;
     int cur = 0;
     QStringList files = restoredFiles(&cur);
     if (files.isEmpty()) return;
-    // 首条 replace 开始播放，其余 append 排队；最后定位上次条目。
-    // loadfile 全部同步命令（mpv 启动阶段无 core-lock 竞争）。
-    mpv_->commandV({"loadfile", files[0].toUtf8().constData(), nullptr});
-    for (int i = 1; i < files.size(); i++)
-        mpv_->commandV({"loadfile", files[i].toUtf8().constData(), "append", nullptr});
-    if (cur != 0)
+    restoreBlurayDevice(files);
+    // 快照存在 → loadlist 一次性展开（条目名来自 #EXTINF）；否则退回逐条 loadfile。
+    const QString snap = playlistSnapshotPath();
+    if (QFile::exists(snap)) {
+        mpv_->commandV({"loadlist", snap.toUtf8().constData(), nullptr});
+    } else {
+        mpv_->commandV({"loadfile", files[0].toUtf8().constData(), nullptr});
+        for (int i = 1; i < files.size(); i++)
+            mpv_->commandV({"loadfile", files[i].toUtf8().constData(), "append", nullptr});
+    }
+    if (cur > 0)
         mpv_->commandV({"playlist-play-index", std::to_string(cur).c_str(), nullptr});
 }
 
@@ -822,8 +872,16 @@ void PlayerViewModel::restorePlaylistIdle() {
     int cur = -1;
     const QStringList files = restoredFiles(&cur);
     if (files.isEmpty()) return;
-    for (const QString &f : files)
-        mpv_->commandV({"loadfile", f.toUtf8().constData(), "append", nullptr});
+    restoreBlurayDevice(files);
+    // `loadlist` = mpv 原生"把播放列表文件展开进当前列表"：条目名来自
+    // #EXTINF（demux_playlist），与 ISO 展开同一套机制。缺快照时退回逐条 append。
+    const QString snap = playlistSnapshotPath();
+    if (QFile::exists(snap)) {
+        mpv_->commandV({"loadlist", snap.toUtf8().constData(), "append", nullptr});
+    } else {
+        for (const QString &f : files)
+            mpv_->commandV({"loadfile", f.toUtf8().constData(), "append", nullptr});
+    }
     // lastPath_ = 播放键要载入的条目（play() 的 !fileLoaded_ 分支据此走
     // resumeLastPath；path 观察器在未载入时不会覆盖它）。
     if (cur >= 0 && cur < files.size()) {
@@ -832,11 +890,66 @@ void PlayerViewModel::restorePlaylistIdle() {
     }
 }
 
+// 上次播放列表的快照路径（m3u8，带 #EXTINF 标题）。
+// 放 AppDataLocation（~/.local/share/vsr-player/），与 fonts 同级。
+QString PlayerViewModel::playlistSnapshotPath() const
+{
+    const QString dir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    return dir + QStringLiteral("/last-playlist.m3u8");
+}
+
+// 写快照：#EXTM3U + 当前索引（自定义注释）+ 每条 "#EXTINF:-1,<标题>" + 路径。
+// ⚠ 标题里的换行会破坏 m3u 行结构 → 替换成空格（文件名同理，极罕见）。
+void PlayerViewModel::writePlaylistSnapshot(const QStringList &files,
+                                           const QStringList &titles, int cur) const
+{
+    const QString path = playlistSnapshotPath();
+    const QString dir = QFileInfo(path).absolutePath();
+    QDir().mkpath(dir);
+    QSaveFile f(path);              // 原子写：崩溃/断电不会留下半个列表
+    if (!f.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        MLOG_WARN("playlist snapshot: cannot write %s", qUtf8Printable(path));
+        return;
+    }
+    QTextStream out(&f);
+    out << "#EXTM3U\n";
+    out << "#VSR-CURRENT:" << cur << "\n";
+    for (int i = 0; i < files.size(); i++) {
+        QString t = i < titles.size() ? titles[i] : QString();
+        if (!t.isEmpty())
+            out << "#EXTINF:-1," << QString(t).replace(QLatin1Char('\n'), QLatin1Char(' ')) << "\n";
+        out << QString(files[i]).replace(QLatin1Char('\n'), QLatin1Char(' ')) << "\n";
+    }
+    if (!f.commit())
+        MLOG_WARN("playlist snapshot: commit failed for %s", qUtf8Printable(path));
+}
+
 // 恢复列表的持久化来源 + 合法化当前索引：restoredCurrentFile()（启动暂停
 // 判定）与 restorePlaylist()（实际装载）共用同一规则，避免两处分叉。
 QStringList PlayerViewModel::restoredFiles(int *cur) const {
-    const QStringList files = settings_.value("playlist").toStringList();
-    int c = settings_.value("playlistCurrent", -1).toInt();
+    QStringList files;
+    int c = -1;
+    // 先读 m3u8 快照（标题由 mpv 解析）；没有快照再退回旧 settings 的纯路径表
+    QFile f(playlistSnapshotPath());
+    if (f.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        QTextStream in(&f);
+        while (!in.atEnd()) {
+            const QString line = in.readLine();
+            if (line.startsWith(QStringLiteral("#VSR-CURRENT:"))) {
+                bool ok = false;
+                const int v = line.mid(13).trimmed().toInt(&ok);
+                if (ok) c = v;
+            } else if (line.isEmpty() || line.startsWith(QLatin1Char('#'))) {
+                continue;           // 注释 / EXTINF：条目名交给 mpv
+            } else {
+                files << line;
+            }
+        }
+    }
+    if (files.isEmpty()) {
+        files = settings_.value("playlist").toStringList();
+        c = settings_.value("playlistCurrent", -1).toInt();
+    }
     if (!files.isEmpty() && (c < 0 || c >= files.size()))
         c = 0;
     if (cur) *cur = c;
@@ -906,7 +1019,10 @@ void PlayerViewModel::play() {
     if (!mpv_) return;
     if (!fileLoaded_) {
         // 没有任何重播目标（列表为空）→ 保持 idle，不要凭空载入/追加
-        if (lastPath_.isEmpty() && idlePlayIndex_ < 0) return;
+        if (lastPath_.isEmpty() && idlePlayIndex_ < 0) {
+            MLOG_INFO("play: nothing to resume (no replay target; playlist empty)");
+            return;
+        }
         resumeLastPath();
     }
     playing_ = true;
@@ -1010,6 +1126,9 @@ void PlayerViewModel::stop() {
     // async：GUI 线程不阻塞 core-lock（同 seek；同步命令会与软解 DR 帧
     // 分配互锁，见 path 观察器注释）。
     mpv_->commandAsync({"stop", "keep-playlist", nullptr});
+    // 停止后 mpv 不再产帧，rtImage 里留着最后一帧 → 主动置黑
+    //（与"清空播放列表"同一条路径，见 playlistEmptied 的注释）。
+    emit playlistEmptied();
 }
 
 void PlayerViewModel::seekAbsolute(int64_t ms) {
@@ -1053,6 +1172,7 @@ void PlayerViewModel::seekRelative(int64_t offsetMs) {
     if (target < 0) target = 0;
     if (duration_ > 0 && target > duration_) target = duration_;
     seekAbsolute(target);
+    emit seekNudged();   // 只有按键路径走到这里（UI 拖动走 seekAbsolute）
 }
 
 void PlayerViewModel::notePlaybackRestart() {
@@ -1068,6 +1188,11 @@ void PlayerViewModel::notePlaybackRestart() {
 }
 
 // ── Audio（乐观更新）────────────────────────────────────────────────
+
+void PlayerViewModel::nudgeVolume(double delta) {
+    setVolume(volume_ + delta);
+    emit volumeNudged();
+}
 
 void PlayerViewModel::setVolume(double vol) {
     if (!mpv_) return;
@@ -1161,6 +1286,15 @@ void PlayerViewModel::setDenoiseQuality(int d) {
     if (denoise_ != d) { denoise_ = d; emit denoiseQualityChanged(); }
     saveSettings("denoiseQuality", d);
     pushVf("vsr", "denoise", denoiseStr());
+    // 3D 每眼映射（链重建后回到滤镜默认"非 3D"，必须重放，否则 3D 下
+    // auto 倍率会退回 2D 公式 → TAB 拍偏软 / 半幅偏大）。
+    {
+        const int layer = stereoLayout_.load();
+        pushVf("vsr", "stereo",
+               layer < 0 ? "off"
+                         : std::string(layer ? "tab " : "sbs ")
+                               + (stereoHalf_.load() ? "half" : "full"));
+    }
     bool nowActive = vsrActive();
     if (wasActive != nowActive) emit vsrActiveChanged();
 }
@@ -1380,8 +1514,65 @@ void PlayerViewModel::setAspect(const QString &v) {
     if (!mpv_) return;
     if (aspect_ != v) { aspect_ = v; emit aspectChanged(); }
     saveSettings("aspect", v);
+    applyAspect();
+}
+
+// 画面比例下发。**3D 眼镜模式**下 UI 里的值语义是"每眼比例"（用户关心的是
+// 每只眼看到的画幅），而 mpv 的 override 作用于整帧，所以要按 layout×half 换算：
+//   左右·全 = R×2（每眼占帧宽一半）    左右·半 = R（合成时半幅已拉伸成整帧）
+//   上下·全 = R÷2                      上下·半 = R
+// 2D / 单眼模式原样下发（单眼帧已烘焙成标准画幅）。
+// 换算结果变化时（进/出 3D、切布局、切全半）都要重下发 → 那几个入口都调这里。
+// 片源格式自动判定的输入必须是**原生像素尺寸**（video-params/w,h）：
+// 用 aspect 会被用户设的 video-aspect-override 污染（见 applyAspect 的换算）。
+// 判据（与 3D 映射的语义一致）：
+//   宽/高 ≥ 2.6 → 左右并排·全幅（如 3840×1080 = 3.556）
+//   宽/高 ≤ 1.25 → 上下并列·全幅（如 1920×2160 = 0.889；注意 4:3 = 1.333 不会被误判）
+//   其它（16:9 / 4:3 等）→ 不猜（半幅无法从尺寸区分，只能手选）
+void PlayerViewModel::guessSourceFormat(int w, int h) {
+    if (w <= 0 || h <= 0)
+        return;
+    const double a = double(w) / double(h);
+    int layout = -1, half = 0;
+    if (a >= 2.6)       { layout = 0; half = 0; }
+    else if (a <= 1.25) { layout = 1; half = 0; }
+    else return;
+    // 只在判定结果与当前不同时发（避免每帧刷）
+    if (layout == sourceFormatLayout_ && half == sourceFormatHalf_)
+        return;
+    sourceFormatLayout_ = layout;
+    sourceFormatHalf_ = half;
+    MLOG_INFO("source format: %dx%d (aspect %.3f) -> %s %s", w, h, a,
+              layout == 0 ? "sbs" : "tab", half ? "half" : "full");
+    if (sourceLayoutHint_.exchange(layout) != layout)
+        emit sourceLayoutHintChanged();
+}
+
+void PlayerViewModel::applyAspect() {
+    if (!mpv_) return;
+    QString out = aspect_;
+    const int layout = stereoLayout_.load();   // -1 = 非 3D
+    if (layout >= 0 && out != QLatin1String("no")) {
+        const QStringList parts = out.split(':');
+        bool ok = false;
+        double v = 0;
+        if (parts.size() == 2) v = parts[0].toDouble(&ok) / parts[1].toDouble(&ok);
+        else                   v = out.toDouble(&ok);
+        if (ok && v > 0.01) {
+            const bool half = stereoHalf_.load() != 0;
+            double f = 1.0;
+            if (!half) f = (layout == 0) ? 2.0 : 0.5;
+            out = QString::number(v * f, 'f', 4);
+        }
+    }
+    if (out != aspectApplied_) {
+        aspectApplied_ = out;
+        MLOG_INFO("aspect: %s -> %s%s", aspect_.toStdString().c_str(),
+                  out.toStdString().c_str(),
+                  layout >= 0 ? " (per-eye)" : "");
+    }
     // async（主线程 UI 操作——同步 set 死锁风险同 FILE_LOADED 根因）
-    mpv_->setPropertyStringAsync("video-aspect-override", v.toStdString());
+    mpv_->setPropertyStringAsync("video-aspect-override", out.toStdString());
 }
 
 void PlayerViewModel::setSpeed(double speed) {
@@ -1423,6 +1614,7 @@ void PlayerViewModel::showOsd() {
 
 void PlayerViewModel::toggleOsd() {
     osdVisible_.store(!osdVisible_.load());
+    MLOG_INFO("osd: %s (toggle)", osdVisible_.load() ? "shown" : "hidden");
     emit osdVisibleChanged();
     if (osdVisible_.load()) {
         // 打开：osd-level 由事件线程 idle 回调应用（≤100ms）；
@@ -1499,33 +1691,60 @@ void PlayerViewModel::openFiles(const QStringList &pathsIn, int mode) {
         }
         return;
     }
-    if (mode == 4) {   // 打开 URL：网络流播放（toLocalPath 原样透传），
-        // 跳过混拖分类（URL 以 .srt 结尾会被误判为字幕 sub-add）
-        bool first = true;
-        for (const QString &p : paths) {
-            if (first) mpv_->commandAsync({"loadfile", p.toUtf8().constData(), nullptr});
-            else       mpv_->commandAsync({"loadfile", p.toUtf8().constData(), "append", nullptr});
-            first = false;
-        }
-        return;
-    }
-    // 文件夹不在此扫描：目录路径原样交给 mpv 的 loadfile，由 mpv 的
-    // demux_playlist 展开（--directory-mode 默认 lazy）——顶层媒体按 mpv
-    // 的扩展名表（video/audio/image/archive/playlist）展开，子目录作为
-    // 条目留在列表里、点击时才再展开。与拖放（mode 0/1）同一条通路，
-    // 所以"打开文件夹"与拖入文件夹的行为一致。
-    // 混拖分类：字幕文件 → sub-add，其余 → loadfile（混合目录场景）
-    bool first = true;
+    // ── 展开蓝光 ISO / BDMV 目录 ───────────────────────────────────
+    // 用户 2026-10-26 定：**不特殊对待**——和普通文件一样按顺序播放（首条
+    // 播放、其余排队），ISO 只是把自己展开成多个 title 条目。
+    // 关键点：mpv 的 bd:// 设备来自全局选项 bluray-device（URL 里带绝对路径
+    // 会被 "bd://<title>/<device>" 的解析吃掉前导斜杠），所以每条 bd://
+    // 条目记下它属于哪张盘，入列前把设备切过去（命令队列有序）。
+    struct Item {
+        QString path;
+        QString device;   // 非空 = 蓝光条目，入列前要设 bluray-device
+    };
+    QVector<Item> items;
+    items.reserve(paths.size());
     for (const QString &p : paths) {
-        if (isSubtitleFile(p)) {
-            mpv_->commandAsync({"sub-add", p.toUtf8().constData(), "select", nullptr});
-            noteExternalSubAdded(p);   // 即时落盘（pending 暂存未回写路径）
+        if (mode != 4 && !isSubtitleFile(p) && bdisc::isBlurayPath(p)) {
+            // ISO 由 **mpv 自己**展开（src/mpv/demux/demux_playlist.c 的
+            // parse_bluray：`.iso` + libbluray 枚举 → bd://mpls/<n>//<path>
+            // 条目，带 title），语义与"文件夹 / m3u 容器"完全一致。
+            // 客户端只做两件事：① 把 ISO 路径原样交给 mpv；
+            // ② 顺便枚举一次登记友好名（播放列表里显示 "Title 6 · 1:18:30"
+            //    而不是一长串 URL）。失败不影响播放（mpv 会自己报错）。
+            // ISO 由 mpv 自己展开（demux_playlist 的 parse_bluray），条目名也由
+            // 它给（"Title N · H:MM:SS"）。客户端只枚举一次做日志/设备记录，
+            // 不再自己维护条目名（恢复列表走 m3u8 快照 + loadlist，同样由 mpv
+            // 解析 #EXTINF 得到名字）。
+            const BlurayDiscInfo info = bdisc::enumerate(p);
+            if (!info.ok)
+                MLOG_WARN("bluray: %s: %s (mpv will report the real error)",
+                          qUtf8Printable(QFileInfo(p).fileName()),
+                          qUtf8Printable(info.error));
+            items.append({p, p});
             continue;
         }
-        if (mode == 1 || !first)
-            mpv_->commandAsync({"loadfile", p.toUtf8().constData(), "append", nullptr});
+        items.append({p, QString()});
+    }
+
+    // 兜底：把最后一张盘设成全局 bluray-device（URL 里的设备优先，不影响正确性；
+    // 但老版本持久化下来的裸 `bd://mpls/N` 条目靠它还能打开）。
+    for (const Item &it : items) {
+        if (it.device.isEmpty()) continue;
+        mpv_->setPropertyStringAsync("bluray-device", it.device.toStdString());
+    }
+
+    bool first = true;
+    for (const Item &it : items) {
+        const QByteArray p = it.path.toUtf8();
+        if (mode != 4 && isSubtitleFile(it.path)) {
+            mpv_->commandAsync({"sub-add", p.constData(), "select", nullptr});
+            noteExternalSubAdded(it.path);
+            continue;   // 字幕不算"首条"，不消耗播放位
+        }
+        if (first && mode != 1)
+            mpv_->commandAsync({"loadfile", p.constData(), nullptr});
         else
-            mpv_->commandAsync({"loadfile", p.toUtf8().constData(), nullptr});
+            mpv_->commandAsync({"loadfile", p.constData(), "append", nullptr});
         first = false;
     }
 }
@@ -1949,10 +2168,25 @@ std::string PlayerViewModel::vfOption() const {
                                  : ("@hwup:hwup=cuda-uuid=" + aiCudaUuid_);
     // 旋转（CUDA 零拷贝）：hwup 之后、vsr/vfg 之前。链上恒有（angle=0
     // =直通），运行期 vf-command 只改实例选项、不重建链。
+    // 单眼输出（CUDA 零拷贝）：hwup 之后、rot/vsr 之前 —— 先把帧裁成一只眼，
+    // 下游（rot/vsr/truehdr/vfg/VO）就都按普通 2D 单眼帧工作（VSR auto 自然也按
+    // 单眼画幅算）。eye=off 时直通。布局/全半进链串，链重建后自动恢复。
+    static const char *kEyeNames[] = {"off", "left", "right"};
+    static const char *kLayoutNames[] = {"sbs", "tab"};
+    const int eyeModeNow = eyeMode_.load();
+    const std::string eye = std::string("@eye:eye:mode=")
+                          + kEyeNames[eyeModeNow < 0 || eyeModeNow > 2 ? 0 : eyeModeNow]
+                          + ":layout=" + kLayoutNames[eyeLayout_.load() ? 1 : 0]
+                          + ":half=" + std::to_string(eyeHalf_.load() ? 1 : 0);
     const std::string rot = "@rot:rot=angle=" + std::to_string(rotMode_.load());
+    // stereo-layout/-half 进链串：3D 每眼映射要能在**链重建后自动恢复**
+    //（解码器软硬切换、格式变化都会重建用户滤镜链，只靠 vf-command 会被抹掉
+    // ——2026-10-26 实测：手动推过的倍率在链重建后回到 2D 公式）。
     const std::string vsr = "@vsr:vsr:scale=" + scaleOpt
                           + ":denoise=" + denoiseString()
-                          + ":quality=" + qualityString();
+                          + ":quality=" + qualityString()
+                          + ":stereo-layout=" + std::to_string(stereoLayout_.load())
+                          + ":stereo-half=" + std::to_string(stereoHalf_.load());
     const int fruc = frucFps_.load();
     // SDR→HDR10 上变换（VFX TrueHDR）：**恒在 vsr 之后**（方案 §8.1：VSR 输入
     // 保持今天的 SDR 分布不变）。链串里恒 `enable=no`——实际状态由 HDR 策略经
@@ -1983,11 +2217,11 @@ std::string PlayerViewModel::vfOption() const {
             fprintf(stderr, "[truehdr] upconversion is not supported with --fruc-order pre "
                             "(design §8.1); the truehdr filter is not inserted in this order\n");
         }
-        return hwup + "," + rot + "," + vfg + "," + vsr;
+        return hwup + "," + eye + "," + rot + "," + vfg + "," + vsr;
     }
-    return hwup + "," + rot + "," + vsr + "," + up + "," + vfg;
+    return hwup + "," + eye + "," + rot + "," + vsr + "," + up + "," + vfg;
 #else
-    std::string vf = hwup + "," + rot + ",";
+    std::string vf = hwup + "," + eye + "," + rot + ",";
     if (fruc == 2 || fruc == 3 || fruc == 4) {
         vf += std::string("@") + frucFilterName() + ":" + frucFilterName()
             + ":fps=off:scale=" + std::to_string(fruc) + ",";
@@ -2223,6 +2457,74 @@ void PlayerViewModel::setUpHdrDebanding(bool on) {
     pushVf("truehdr", "debanding-off", on ? "0" : "1");
 }
 
+void PlayerViewModel::replayStereoMap() {
+    if (!mpv_ || !aiAvailable_.load()) return;
+    const int l = stereoLayout_.load();
+    pushVf("vsr", "stereo",
+           l < 0 ? "off"
+                 : std::string(l ? "tab " : "sbs ")
+                       + (stereoHalf_.load() ? "half" : "full"));
+    // 单眼输出同样要重放（链重建会把运行期 vf-command 全部抹掉）
+    static const char *kNames[] = {"off", "left", "right"};
+    const int em = eyeMode_.load();
+    pushVf("eye", "eye", kNames[em < 0 || em > 2 ? 0 : em]);
+    pushVf("eye", "eye",
+           std::string("stereo ") + (eyeLayout_.load() ? "tab " : "sbs ")
+                 + (eyeHalf_.load() ? "half" : "full"));
+}
+
+void PlayerViewModel::setStereoMap(bool active, int layout, int half) {
+    const int nl = active ? (layout == 1 ? 1 : 0) : -1;
+    const int nh = half ? 1 : 0;
+    const int old = stereoLayout_.exchange(nl);
+    const int oldHalf = stereoHalf_.exchange(nh);
+    if (old == nl && oldHalf == nh) return;
+    if (!mpv_) return;
+    if (!aiAvailable_.load()) return;   // 链上没插 vsr，vf-command 无处可发
+    // 3D：auto 倍率按"单眼视口 vs 单眼源像素"算（见 vf_vsr compute_adaptive_scale）
+    pushVf("vsr", "stereo",
+           nl < 0 ? "off"
+                  : std::string(nl ? "tab " : "sbs ") + (nh ? "half" : "full"));
+    applyAspect();   // 3D 的每眼比例换算因子随 layout/half/active 变化
+}
+
+void PlayerViewModel::setEyeState(int mode, int layout, int half) {
+    const int nm = (mode < 0 || mode > 2) ? 0 : mode;
+    // layout/half < 0 = 保持当前源格式（RPC/菜单只改眼别时不必重复传布局）
+    const int nl = (layout < 0) ? eyeLayout_.load() : (layout == 1 ? 1 : 0);
+    const int nh = (half < 0) ? eyeHalf_.load() : (half ? 1 : 0);
+    const int oldMode = eyeMode_.exchange(nm);
+    const int oldLayout = eyeLayout_.exchange(nl);
+    const int oldHalf = eyeHalf_.exchange(nh);
+    if (oldMode == nm && oldLayout == nl && oldHalf == nh)
+        return;
+    if (nm != oldMode)
+        emit eyeModeChanged();
+    if (!mpv_)
+        return;
+    // 链上没插 eye 时（AI 不可用 → 只有 hwup+rot）vf-command 无处可发；
+    // 链重建后由 syncVfOptions() 重放。
+    if (!aiAvailable_.load())
+        return;
+    static const char *kNames[] = {"off", "left", "right"};
+    pushVf("eye", "eye", kNames[nm]);
+    pushVf("eye", "eye",
+           std::string("stereo ") + (nl ? "tab " : "sbs ") + (nh ? "half" : "full"));
+    applyAspect();   // 同上：源格式变化会影响 3D 下的每眼换算
+    MLOG_INFO("eye: mode=%s layout=%s size=%s", kNames[nm],
+              nl ? "tab" : "sbs", nh ? "half" : "full");
+}
+
+void PlayerViewModel::setEyePref(int pref) {
+    const int np = pref ? 1 : 0;
+    if (eyePref_.exchange(np) != np)
+        emit eyePrefChanged();
+    // 只改偏好；若单眼模式正在跑，把当前显示的眼同步成新偏好（同一个选项的
+    // 即时生效，不是跨选项联动）。
+    if (eyeMode_.load() != 0)
+        setEyeState(np ? 2 : 1, -1, -1);
+}
+
 void PlayerViewModel::syncVfOptions() {
     if (!mpv_) return;
     if (!aiAvailable_.load()) return;   // 链上没插滤镜，vf-command 无处可发
@@ -2249,6 +2551,15 @@ void PlayerViewModel::syncVfOptions() {
     // 旋转：链重建后回到链串里的 angle（初始值 = 持久化值，正常情况
     // 无需重放；这里仍推一次，保证运行期改过角度后换片不丢）。
     pushVf("rot", "angle", std::to_string(rotMode_.load()));
+    // 单眼输出（vf_eye）：链重建后运行期 vf-command 全被抹掉 → 重放模式与源格式。
+    {
+        static const char *kEyeNames[] = {"off", "left", "right"};
+        const int em = eyeMode_.load();
+        pushVf("eye", "eye", kEyeNames[em < 0 || em > 2 ? 0 : em]);
+        pushVf("eye", "eye",
+               std::string("stereo ") + (eyeLayout_.load() ? "tab " : "sbs ")
+                     + (eyeHalf_.load() ? "half" : "full"));
+    }
     MLOG_INFO("syncVfOptions: truehdr enable=%d lum=%d sat=%d contrast=%d mg=%d deband=%d",
               int(upconvertOn_), effectiveUpHdrLuminance(), upHdrSaturation_,
               upHdrContrast_, upHdrMiddleGray_, int(upHdrDebanding_));
@@ -2577,15 +2888,39 @@ std::string PlayerViewModel::osdTextString() {
 /// 主线程调 osd-msg1 更新会与 untimed 渲染死锁，实测卡死）。
 void PlayerViewModel::osdPoll() {
     if (!mpv_) return;
-    bool visible = osdVisible_.load();
-    if (visible != osdLevelApplied_) {
-        osdLevelApplied_ = visible;
-        mpv_->setPropertyString("osd-level", visible ? "1" : "0");
+    const bool visible = osdVisible_.load();
+    // 3D：mpv 的 OSD 会被合成器按左/右半幅切开（每行只剩一半字），改用
+    // QML 覆盖层渲染 osdText —— mpv 侧强制 osd-level=0（单一 osdVisible 状态）。
+    const bool useMpvOsd = visible && !stereo3d_.load();
+    if (useMpvOsd != osdLevelApplied_) {
+        osdLevelApplied_ = useMpvOsd;
+        mpv_->setPropertyString("osd-level", useMpvOsd ? "1" : "0");
     }
     if (!visible) return;
-    std::string text = osdTextString();
+
+    const std::string text = osdTextString();
+    bool textChanged = false;
     if (text != osdLastText_) {
-        osdLastText_ = std::move(text);
-        mpv_->setPropertyString("osd-msg1", osdLastText_);
+        osdLastText_ = text;
+        textChanged = true;
+        if (useMpvOsd)
+            mpv_->setPropertyString("osd-msg1", osdLastText_);
     }
+    // 3D 的 QML 覆盖层读这份缓存。切换渲染器（进出 3D）时即使文本没变也要
+    // 在下次轮询把最新文本交给 QML；emit 只在内容真变时才发（避免每秒刷）。
+    if (stereo3d_.load() || textChanged) {
+        const QString qt = QString::fromStdString(osdLastText_);
+        bool qChanged = false;
+        {
+            std::lock_guard<std::mutex> lk(osdTextMu_);
+            if (osdText_ != qt) { osdText_ = qt; qChanged = true; }
+        }
+        if (qChanged)
+            emit osdTextChanged();
+    }
+}
+
+QString PlayerViewModel::osdText() const {
+    std::lock_guard<std::mutex> lk(osdTextMu_);
+    return osdText_;
 }

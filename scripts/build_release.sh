@@ -18,9 +18,9 @@
 #   ├── mpv-vsr               # CLI 二进制（RPATH 同款）
 #   ├── lib/vsr-player/       # 安装 → ~/.local/lib/vsr-player/（与 VFX 汇合）
 #   │   ├── libmpv.so.2       #    libmpv + 闭包捆绑依赖（RPATH 同款）
-#   │   ├── ffmpeg ×7         #    防系统版本漂移（62→63 实测破坏）
 #   │   ├── 光盘媒体栈         #    libcdio*/libdvd*/libbluray（cdda/蓝光/ISO）
-#   │   ├── libnvrtc/builtins/cudart.so.13   # CUDA runtime（mpv 硬依赖）
+#   │   ├── ffmpeg ×7         #    仅 full（standard 用系统 FFmpeg）
+#   │   ├── libnvrtc/builtins/cudart.so.13   # 仅 full（standard 用系统 CUDA runtime）
 #   │   └── libnvinfer(+plugin).so.11        # 仅 rife：TRT 11.2.1.2（engine 版本绑定）
 #   ├── lib/                  # 仅 full：Qt6 库（插件 RUNPATH 期望 <prefix>/lib）
 #   ├── lib/qt6/plugins/      # 仅 full：platforms(wayland/xcb) + wayland-* + imageformats
@@ -38,9 +38,10 @@ PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$PROJECT_ROOT"
 
 # ── 变体 + 插帧后端 ──────────────────────────────────────────────────
-# standard（默认）：捆绑 FFmpeg/CUDA + 光盘媒体栈（rife 后端另含 TRT + RIFE 引擎）；
-#                   GUI 依赖系统 Qt ≥ 6.12。
-# full：额外捆绑最小 Qt（库 + 平台插件 + QML 模块，镜像发行版布局），
+# standard（默认）：只捆 libmpv + 光盘媒体栈；**FFmpeg / CUDA runtime / Qt 一律用系统**
+#                   （要求系统 Qt ≥ 6.12、FFmpeg soname 与构建机一致、CUDA runtime 可解析）。
+# full：额外捆绑 FFmpeg ×7 + CUDA runtime（libnvrtc/builtins/cudart）+ 最小 Qt
+#       （库 + 平台插件 + QML 模块，镜像发行版布局）；
 #       用户侧只需驱动 + Vulkan loader + 基础 C 运行库。
 # 依赖收集 = 传递闭包 + 系统白名单：非白名单的 NEEDED 自动捆绑，
 # 因此系统 soname 升级（如 libcdio .so.19→.so.21）不会漏收。
@@ -121,6 +122,31 @@ fi
 cp "$CLIENT_DIST/src/client/vsr-player" "$STAGE/vsr-player"
 cp "$MPV_DIST/_build/mpv" "$STAGE/mpv-vsr"
 cp -L "$MPV_DIST/_build/libmpv.so.2" "$STAGE/lib/vsr-player/libmpv.so.2"
+
+# standard 变体：把 libmpv / mpv-vsr 的 FFmpeg DT_NEEDED 从带版本 soname
+# （libavcodec.so.63）改成无版本名（libavcodec.so），由安装时按**目标机实际版本**
+# 建链接 —— 这样包本身不再钉任何 FFmpeg 版本。只用 FFmpeg 家族：libnvrtc 的符号
+# 版本命名空间就是 soname，改 NEEDED 会破坏符号版本（见 rewrite-needed.py 注释）。
+# 记录**构建期的 FFmpeg 主版本**：standard 把 NEEDED 去版本化后就再也看不出
+# 原本依赖哪个 major 了，而跨 major 是没有 ABI 承诺的（能加载 ≠ 行为对）。
+# install.sh 会拿这个文件对照目标机实际装的 libavcodec 主版本，不一致就告警。
+# 注意：needed_of() 在 [4/6] 才定义，这里用 readelf 直读（staging 早于它）
+readelf -d "$MPV_DIST/_build/libmpv.so.2" \
+    | sed -n 's/.*(NEEDED).*\[libavcodec\.so\.\([0-9]*\)\].*/\1/p' \
+    > "$STAGE/lib/vsr-player/VSR-FFMPEG-MAJOR"
+echo "  ✓ 记录构建期 FFmpeg 主版本: $(cat "$STAGE/lib/vsr-player/VSR-FFMPEG-MAJOR")"
+
+# 绝对路径形式的 NEEDED（libmujs）两个变体都要改成 basename；FFmpeg 去版本化
+# 只在 standard 做（full 自带匹配的库，没必要改）。
+if [ "$VARIANT" = standard ]; then
+    python3 scripts/rewrite-needed.py --ffmpeg \
+        "$STAGE/lib/vsr-player/libmpv.so.2" "$STAGE/mpv-vsr"
+    echo "  ✓ FFmpeg NEEDED 去版本化 + 绝对路径去目录（安装时链接系统实际版本）"
+else
+    python3 scripts/rewrite-needed.py \
+        "$STAGE/lib/vsr-player/libmpv.so.2" "$STAGE/mpv-vsr"
+    echo "  ✓ 绝对路径 NEEDED 去目录（libmujs）"
+fi
 # Wayland 空闲抑制模块（可选）：主程序 dlopen；目标机无 QtWaylandClient 时
 # 加载失败 → 回退 org.freedesktop.ScreenSaver（不会导致启动失败）。
 IDLE_MOD="$CLIENT_DIST/src/client/libvsr-idle-wayland.so"
@@ -171,9 +197,13 @@ collect_to() {  # collect_to <outdir> <soname> <search-dirs...>（SONAME 即目�
 LIB="$STAGE/lib/vsr-player"
 collect() { collect_to "$LIB" "$@"; }
 
-# 4a. 核心集：FFmpeg / CUDA runtime（+ rife 后端才有的 TensorRT，版本绑定，显式固定）
-for f in libavcodec.so.63 libavformat.so.63 libavutil.so.61 libavfilter.so.12 \
-         libswscale.so.10 libswresample.so.7 libavdevice.so.63; do
+# 4a. 核心集：FFmpeg / CUDA runtime 仅 full 变体捆绑（standard 用系统提供——分层是
+#     用户 2026-10-26 定的：standard = 薄包，full = 自洽包）。
+#     rife 后端才有的 TensorRT 保持原样（版本绑定，显式固定）。
+if [ "$VARIANT" = full ]; then
+# FFmpeg 的 soname **从 libmpv 的 NEEDED 推导**，不硬编码版本号：以后 ffmpeg
+# 大版本升级（63→64）自动跟随，脚本不会打出一个钉死旧 soname 的包。
+for f in $(needed_of "$LIB/libmpv.so.2" | grep -E '^lib(av|sw)' | sort -u); do
     collect "$f" /usr/lib
 done
 # CUDA runtime：**不要钉 minor/patch 版本号**，从 /opt/cuda/lib64 发现实际 soname。
@@ -201,6 +231,13 @@ cuda_collect() {  # cuda_collect <基础名>（libnvrtc / libnvrtc-builtins / li
 cuda_collect libnvrtc
 cuda_collect libnvrtc-builtins
 cuda_collect libcudart
+else
+    # standard 的系统依赖同样从 NEEDED 推导，构建日志里直接列出"这包要求系统有什么"，
+# 而不是写死一份可能过期的清单。
+    SYS_DEPS="$(needed_of "$LIB/libmpv.so.2" \
+                | grep -E '^lib(av|sw|nvrtc|cudart)' | sort -u | tr '\n' ' ')"
+    echo "  · standard：FFmpeg / CUDA 用系统提供 —— 要求系统提供: ${SYS_DEPS:-（无）}"
+fi
 # TensorRT 库只有 rife 后端需要（引擎反序列化）；vfg 包不收集 libnvinfer*。
 if [ "$FRUC_BACKEND" = rife ]; then
     collect libnvinfer.so.11 /usr/lib
@@ -208,16 +245,61 @@ if [ "$FRUC_BACKEND" = rife ]; then
 fi
 
 # 4b. 光盘/蓝光媒体栈：从实际 NEEDED 发现 soname——**不要硬编码**。
+# ⚠ 2026-10-26 用户发的"标准版不携带第三方依赖"规则：整段只在 full 变体执行，
+# standard 由系统提供（缺了安装自检会明确报错，不会静默）。
+if [ "$VARIANT" = full ]; then
 #     2026-09 事故：libcdio .so.19→.so.21、libbluray .so.3→.so.4 升级后，
 #     未捆绑的旧 soname 让二进制启动失败（libmpv 的 cdda/蓝光 + libavformat 的 bluray）。
+#     发现必须**迭代到不动点**：libmpv → libcdio/libdvdnav → libdvdread 是两层链，
+#     只看 libmpv 的 NEEDED 会漏掉第二层（standard 不捆 libavformat 后实测：
+#     libdvdnav.so.4 → libdvdread.so.8 闭包自检报"未捆绑"）。之前没暴露是因为
+#     libavformat 的 NEEDED 里恰好也有 libdvdread。
 MEDIA=""
-for f in "$LIB"/libmpv.so.2 "$LIB"/libavformat.so.*; do
-    [ -f "$f" ] || continue
-    MEDIA+="$(needed_of "$f" | grep -E '^lib(cdio|dvd|bluray)' || true)"$'\n'
+prev=""
+for _ in 1 2 3 4; do
+    MEDIA="$(for f in "$LIB"/*.so*; do
+                 [ -f "$f" ] || continue
+                 needed_of "$f" | grep -E '^lib(cdio|dvd|bluray)' || true
+             done | sort -u)"
+    [ "$MEDIA" = "$prev" ] && break
+    for f in $MEDIA; do [ -e "$LIB/$f" ] || collect "$f" /usr/lib; done
+    prev="$MEDIA"
 done
-MEDIA="$(printf '%s' "$MEDIA" | sed '/^$/d' | sort -u)"
-for f in $MEDIA; do collect "$f" /usr/lib; done
 [ -n "$MEDIA" ] && echo "  ✓ 媒体栈: $(printf '%s' "$MEDIA" | tr '\n' ' ')"
+else
+    echo "  · standard：光盘媒体栈由系统提供（libcdio/libdvd/libbluray）"
+fi
+
+# 4b2. 两个"跨版本不可替换"的小库：**两个变体都捆**（合计 ~0.5 MB）
+#  ① libplacebo（soname = API 版本，每次 libplacebo 发版就跳）：mpv 传给
+#     pl_log_create 的 api_ver 在库里是 "historical, ignored currently"
+#     （/usr/include/libplacebo/log.h:69）→ 跨版本链接是**静默 ABI 赌注**，
+#     不像 libnvrtc 会明确报错。0.4 MB 换确定性，值。
+#  ② libmujs：**没有 SONAME**，mpv 链接时把绝对路径 /usr/lib/libmujs.so 整条记进
+#     NEEDED（Debian 在 /usr/lib/x86_64-linux-gnu/）→ 换个发行版直接起不来。
+#     rewrite-needed.py 会把该 NEEDED 改成 basename，所以这里必须把库带上。
+PLACEBO_SO="$(needed_of "$LIB/libmpv.so.2" | grep -E '^libplacebo\.so\.[0-9]+$' | head -1)"
+if [ "$VARIANT" = full ] && [ -n "$PLACEBO_SO" ]; then
+    collect "$PLACEBO_SO" /usr/lib
+    # libplacebo 自己的 shader 编译栈（glslang/shaderc）与 Dolby Vision 依赖，
+    # 按 NEEDED 推导；整栈压缩后 ~0.5 MB，一起带走才算真自洽。
+    # 迭代到不动点：glslang/shaderc 还会拖出 libSPIRV-Tools(-opt) 这一层
+    for _ in 1 2 3 4 5; do
+        added=0
+        for f in $(for b in "$LIB"/*.so*; do
+                       needed_of "$b" | grep -E '^lib(shaderc|glslang|SPIRV|dovi)'
+                   done | sort -u); do
+            [ -e "$LIB/$f" ] && continue
+            collect "$f" /usr/lib >/dev/null && added=$((added + 1))
+            echo "  ✓ $f（libplacebo shader 栈）"
+        done
+        [ "$added" -eq 0 ] && break
+    done
+    collect libmujs.so /usr/lib
+    echo "  ✓ 小库（跨版本不可替换）: $PLACEBO_SO（含 shader 栈）+ libmujs.so"
+else
+    echo "  · standard：libplacebo / libmujs 由系统提供（跨版本不兼容 → 缺了会明确报错）"
+fi
 
 # 4c. full 变体：最小 Qt（镜像发行版布局，插件自带相对 RUNPATH 才能解析）
 #     布局：<prefix>/lib/{libQt6*.so.6} + <prefix>/lib/qt6/{plugins,qml}
@@ -276,8 +358,12 @@ ALLOW+='|libOpenCL|libclang|libLLVM|libwayland-egl'
 ALLOW+='|libOpenGL|libGLdispatch|libGLESv2|liburing|libdouble-conversion|libmd4c|libb2|libSM|libICE|libmtdev|libts|libinput|libhunspell'
 # mpv/FFmpeg 的可选特性依赖（输出/图像/采集），发行版常规组件
 ALLOW+='|libmujs|liblcms2|libcaca|libwebp|libopenjp2|libraw1394|libavc1394|librom1394|libiec61883|libbs2b|libflite|libOpenEXR|libIlmThread|libImath|libzvbi|libdc1394'
-# standard 变体：Qt 由系统提供（硬性要求 ≥ 6.12）；full 变体则必须已捆绑
-[ "$VARIANT" = standard ] && ALLOW+='|libQt6'
+# standard 变体：Qt / FFmpeg / CUDA runtime 全由系统提供；full 变体则必须已捆绑
+if [ "$VARIANT" = standard ]; then
+    ALLOW+='|libQt6'
+    ALLOW+='|libavcodec|libavformat|libavutil|libavfilter|libavdevice|libswscale|libswresample'
+    ALLOW+='|libnvrtc|libcudart'
+fi
 
 validate_closure() {
     local bad=0 f dep base
@@ -287,7 +373,15 @@ validate_closure() {
             base="$(basename "$dep")"          # 绝对路径依赖（无 SONAME 的库）按 basename 判定
             if [ -e "$LIB/$base" ] || [ -e "$STAGE/lib/$base" ]; then continue; fi
             printf '%s' "$base" | grep -qE "^($ALLOW)" && continue
-            echo "  ❌ $(basename "$f") → $dep（未捆绑且不在系统白名单）"
+            # standard 变体按设计**不携带第三方库**（用户 2026-10-26 的发版规则）：
+            # 未捆绑的依赖只要构建机能解析（ldconfig 缓存里有），就算"系统提供"，
+            # 会写进 COMPONENTS.md 的"要求系统提供"表。真正的错误只有一种：
+            # 连构建机都解析不到 —— 那说明 SONAME 拼错或依赖缺失。
+            if [ "$VARIANT" = standard ] && \
+               ldconfig -p 2>/dev/null | awk -v n="$base" '$1==n{found=1} END{exit !found}'; then
+                continue
+            fi
+            echo "  ❌ $(basename "$f") → $dep（未捆绑、不在白名单，且构建机也解析不到）"
             bad=1
         done < <(needed_of "$f")
     done < <(find "$STAGE" -type f \( -name '*.so*' -o -perm -u+x \) 2>/dev/null)
@@ -406,8 +500,11 @@ if [ "$VARIANT" = full ]; then
 - Vulkan loader（`libvulkan.so.1`）与 Wayland/X11 客户端库（发行版常规组件）
 - **Qt6 已随包捆绑**——无需系统 Qt（本变体面向 Qt < 6.12 的发行版）'
 else
-    DEPS_TEXT='- NVIDIA 显卡 + 驱动（`libcuda.so.1`）——唯一强制外部依赖
-- 系统 Qt ≥ 6.12（GUI 版；`mpv-vsr` 命令行版不需要）'
+    DEPS_TEXT='- NVIDIA 显卡 + 驱动（`libcuda.so.1`）
+- 系统 Qt ≥ 6.12（GUI 版；`mpv-vsr` 命令行版不需要）
+- 系统 FFmpeg（soname 需与本包一致：libavcodec.so.63 等）——本包不捆绑
+- 系统 CUDA runtime（libnvrtc.so.13 + libnvrtc-builtins + libcudart.so.13）
+  ——本包不捆绑（需 CUDA Toolkit 或同 soname 运行时）'
 fi
 # README 中随后端分支的段落（vfg 无 TRT/engine，不能留 RIFE 专属说明误导用户）
 if [ "$FRUC_BACKEND" = rife ]; then
@@ -446,6 +543,11 @@ with open(path, 'w', encoding='utf-8') as fh:
     fh.write(content)
 PYEOF
 cp scripts/install.sh "$STAGE/install.sh" && chmod +x "$STAGE/install.sh"
+# 缺 soname 的兼容兜底（install.sh 的 [6/6] 会在系统 ffmpeg/CUDA 大版本升级后调用它）
+cp scripts/soname-compat.sh "$STAGE/soname-compat.sh" && chmod +x "$STAGE/soname-compat.sh"
+
+# 组件版本表（发版必备：full 列自带清单，standard 列系统要求）
+bash scripts/gen-components.sh "$STAGE" "$VARIANT"
 
 tar -C "$PROJECT_ROOT/build" -cJf "$TARBALL" "$STAGE_BASE" \
     --transform "s/$STAGE_BASE/$PKG_NAME/"

@@ -23,7 +23,14 @@
 set -euo pipefail
 
 NO_VFX=0
-[ "${1:-}" = "--no-vfx" ] && NO_VFX=1
+FORCE_DEV=0
+for arg in "$@"; do
+    case "$arg" in
+        --no-vfx) NO_VFX=1 ;;
+        --dev)    FORCE_DEV=1 ;;   # 强制用 build/ dev 树（忽略可能过期的 dist 树）
+        *) echo "未知参数: $arg" >&2; exit 2 ;;
+    esac
+done
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 BIN_DIR="$HOME/.local/bin"
@@ -39,8 +46,9 @@ SRC="$HERE"
 if [ ! -x "$SRC/vsr-player" ] && [ ! -f "$SRC/lib/vsr-player/libmpv.so.2" ]; then
     SRC="$(cd "$HERE/.." && pwd)"   # 仓库根
     MODE=dev
-    # dist 构建树（build_release.sh 产物）优先，dev 树（build/）兜底
-    if [ -x "$SRC/build/client-dist/src/client/vsr-player" ]; then
+    # dist 构建树（build_release.sh 产物）优先，dev 树（build/）兜底；
+    # --dev 强制忽略 dist（发布树可能是很久以前建的 → 装回旧版本）
+    if [ "$FORCE_DEV" -eq 0 ] && [ -x "$SRC/build/client-dist/src/client/vsr-player" ]; then
         GUI_BIN="$SRC/build/client-dist/src/client/vsr-player"
         CLI_BIN="$SRC/build/mpv-dist/_build/mpv"
         LIB_SRC="$SRC/build/release-staging/lib/vsr-player"
@@ -49,6 +57,9 @@ if [ ! -x "$SRC/vsr-player" ] && [ ! -f "$SRC/lib/vsr-player/libmpv.so.2" ]; the
         GUI_BIN="$SRC/build/src/client/vsr-player"
         CLI_BIN="$SRC/build/mpv/_build/mpv"
         LIB_SRC="$SRC/third_party/nvvfx/lib"     # dev：VFX 目录即库源
+        # dev：libmpv 来自 mpv 构建树 —— 必须一起装，否则装出来的播放器用的
+        # 还是旧 libmpv（新滤镜/补丁全部不生效，且没有任何报错）。
+        MPV_LIB_SRC="$SRC/build/mpv/_build"
         ENG_SRC="$SRC/build/tests/fruc"          # dev：engine 构建目录
         DEV_VFX_COPY=1                            # dev：VFX 一并复制
     else
@@ -109,18 +120,63 @@ if [ "$OK" -eq 0 ]; then
     exit 1
 fi
 
+# 覆盖**正在运行**的二进制：`cp` 会 ETXTBSY（Text file busy）失败且不报错退出，
+# 之前的症状 = 安装输出全绿但 md5 没变（2026-10-26 连踩两次）。
+# 修法：写临时文件再 rename（rename 只换目录项，不动被执行的 inode）。
+# 原子复制到目录：写临时文件再 rename（见下面 [2/6] 的 SIGBUS 说明）
+copy_into() {  # copy_into <dstdir> <src...>
+    local dstdir="$1"; shift
+    local f tmp rc=0
+    for f in "$@"; do
+        [ -e "$f" ] || continue
+        tmp="$dstdir/.$(basename "$f").new.$$"
+        if cp -L "$f" "$tmp" 2>/dev/null; then
+            mv -f "$tmp" "$dstdir/$(basename "$f")"
+        else
+            rm -f "$tmp"; rc=1
+        fi
+    done
+    return $rc
+}
+
+install_bin() {  # install_bin <src> <dst>
+    local src="$1" dst="$2" tmp="$2.new.$$"
+    if cp "$src" "$tmp"; then
+        chmod +x "$tmp" && mv -f "$tmp" "$dst"
+    else
+        echo "  ❌ 无法写入 $dst（源 $src）" >&2
+        rm -f "$tmp"
+        return 1
+    fi
+}
+
 # ── 2. 复制自建部分 ──────────────────────────────────────────────────
 echo "--- [2/6] install binaries + bundled libs ---"
 mkdir -p "$BIN_DIR" "$LIB_DIR" "$FONT_DIR" "$BIN_DIR/translations"
-cp "$GUI_BIN" "$BIN_DIR/vsr-player" && chmod +x "$BIN_DIR/vsr-player"
+install_bin "$GUI_BIN" "$BIN_DIR/vsr-player"
 echo "  ✅ $BIN_DIR/vsr-player"
 if [ -x "$CLI_BIN" ]; then
-    cp "$CLI_BIN" "$BIN_DIR/mpv-vsr" && chmod +x "$BIN_DIR/mpv-vsr"
+    install_bin "$CLI_BIN" "$BIN_DIR/mpv-vsr"
     echo "  ✅ $BIN_DIR/mpv-vsr"
 fi
+if [ -n "${MPV_LIB_SRC:-}" ] && [ -d "$MPV_LIB_SRC" ]; then
+    # dev 树：libmpv.so / .so.2 / .so.2.5.0（copy_into 内部 -L 跟随软链并原子替换）。
+    # ⚠ 只能用 -f 过滤：glob 还会匹配 meson 的构建子目录 libmpv.so.2.5.0.p/，
+    # `cp -L` 拷目录会失败（set -e 直接中止安装，实测）。
+    mpv_libs=()
+    for f in "$MPV_LIB_SRC"/libmpv.so "$MPV_LIB_SRC"/libmpv.so.*; do
+        [ -f "$f" ] && mpv_libs+=("$f")
+    done
+    [ ${#mpv_libs[@]} -gt 0 ] && copy_into "$LIB_DIR" "${mpv_libs[@]}"
+    echo "  ✅ libmpv（dev 构建树，${#mpv_libs[@]} 个）→ $LIB_DIR/"
+fi
 if [ -d "$LIB_SRC" ]; then
-    cp -L "$LIB_SRC"/* "$LIB_DIR/"   # -L：跟随软链（VFX 的 ngx-vsr 软链等）
-    echo "  ✅ 捆绑库（ffmpeg/CUDA/TRT/libmpv）→ $LIB_DIR/"
+    # ⚠ 必须**原子替换**（临时文件 + rename）：`cp` 直接覆盖会被
+    # **正在运行的播放器** mmap 着——截断的瞬间进程收到 SIGBUS（实测 2026-10-26：
+    # vo 线程在 libmpv.so.2 里 BUS_ADRERR，core dumped），等于安装把用户正在看的
+    # 播放器打崩。rename 只换目录项，运行中的实例继续用旧 inode，下次启动才换新。
+    copy_into "$LIB_DIR" "$LIB_SRC"/*   # -L 由 copy_into 内部处理（跟随软链）
+    echo "  ✅ 捆绑库（libmpv + 光盘媒体栈）→ $LIB_DIR/"
 fi
 # dev 模式：按 docs 把 wheel 的 nvidia_vfx.libs 放在 third_party/nvidia_vfx.libs，
 # 安装时必须落到上面 RPATH 期望的位置——否则装出来的库加载失败 → VSR 静默直通。
@@ -173,6 +229,12 @@ else
     echo "  ℹ VFG 后端：本包不含 TRT/engine，插帧走 VFX VideoFrameGeneration"
     [ "$HAS_TRT" -eq 1 ] && echo "     （注：$LIB_DIR/ 里有旧版 RIFE 的 TRT 库/引擎残留，不影响 VFG 使用）"
 fi
+# 组件版本表（发版必备）：装到 ~/.local/share/vsr-player/，排障时直接让用户发这个文件
+if [ -f "$SRC/COMPONENTS.md" ]; then
+    mkdir -p "$HOME/.local/share/vsr-player"
+    cp "$SRC/COMPONENTS.md" "$HOME/.local/share/vsr-player/COMPONENTS.md"
+    echo "  ✅ 组件版本表 → ~/.local/share/vsr-player/COMPONENTS.md"
+fi
 FONT_SRC="$SRC/fonts/materialdesignicons-webfont.ttf"
 [ -f "$FONT_SRC" ] || FONT_SRC="$SRC/third_party/material-icons/materialdesignicons-webfont.ttf"
 if [ -f "$FONT_SRC" ]; then
@@ -181,6 +243,9 @@ if [ -f "$FONT_SRC" ]; then
 fi
 TR_SRC="$SRC/translations"
 [ -d "$TR_SRC" ] || TR_SRC="$SRC/build/client-dist/src/client"
+# dev 构建树：meson 的 lrelease custom_target 把 .qm 放在 build/src/client/
+# （此前漏了这一档 → dev 安装沿用了上一版旧 .qm，新增 UI 文案静默回退英文）
+[ -d "$TR_SRC" ] || TR_SRC="$SRC/build/src/client"
 if ls "$TR_SRC"/*.qm >/dev/null 2>&1; then
     cp "$TR_SRC"/*.qm "$BIN_DIR/translations/"
     echo "  ✅ 翻译 → $BIN_DIR/translations/"
@@ -328,10 +393,81 @@ fi
 
 # ── 5. 验证 + 摘要 ──────────────────────────────────────────────────
 echo "--- [6/6] verify ---"
-LDD_MISSING="$(ldd "$BIN_DIR/vsr-player" 2>/dev/null | grep "not found" | head -3 || true)"
-if [ -n "$LDD_MISSING" ]; then
-    echo "  ⚠ vsr-player 依赖缺失:"; echo "$LDD_MISSING"
+# 依赖可解析性：standard 包不捆 FFmpeg/CUDA/Qt，靠系统提供 —— 若系统 soname 与
+# 构建机不一致，这里必须**明确失败**（否则表现为"双击没反应"，用户无从判断）。
+# 与 VFX 的策略一致：要么装成，要么明确报错。
+ldd_check() {  # ldd_check <二进制> <显示名>
+    local bin="$1" name="$2" missing
+    [ -x "$bin" ] || return 0
+    missing="$(ldd "$bin" 2>/dev/null | grep "not found" | head -5 || true)"
+    if [ -n "$missing" ]; then
+        echo "  ❌ $name 依赖缺失（装完也起不来）:" >&2
+        printf '%s\n' "$missing" | sed 's/^/     /' >&2
+        echo "     standard 包不捆绑 FFmpeg / CUDA runtime / Qt，要求系统提供与构建机" >&2
+        echo "     一致的 soname。处理：① 安装对应版本的系统库；② 换 full 变体包" >&2
+        echo "     （./scripts/build_release.sh --variant=full，自带这三类）；③ 源码构建。" >&2
+        return 1
+    fi
+    return 0
+}
+LDD_OK=1
+run_checks() {
+LDD_OK=1
+ldd_check "$BIN_DIR/vsr-player" "vsr-player" || LDD_OK=0
+ldd_check "$BIN_DIR/mpv-vsr" "mpv-vsr" || LDD_OK=0
+# libmpv 必须解析到**本包**：系统若装了 mpv（/usr/lib/libmpv.so.2），捆绑库缺失时
+# 加载器会静默回落到它——程序照样能启动，但跑的是没有 vf_vsr/vf_vfg/vf_rot 和
+# libmpv vo 互操作的原版 mpv（现象："能开但超分/插帧全没了"，且没有任何报错）。
+# 实测：把 $LIB_DIR/libmpv.so.2 挪走，ldd 解析到 /usr/lib/libmpv.so.2、不报缺失。
+MPV_SO="$(ldd "$BIN_DIR/vsr-player" 2>/dev/null | awk '$1=="libmpv.so.2"{print $3; exit}')"
+case "$MPV_SO" in
+    */lib/vsr-player/*)
+        echo "  ✅ libmpv 来自本包（$MPV_SO）" ;;
+    "")
+        echo "  ❌ libmpv.so.2 未解析到（本包 lib/vsr-player/ 里缺它）" >&2
+        LDD_OK=0 ;;
+    *)
+        echo "  ❌ libmpv.so.2 解析到 $MPV_SO —— 不是本包！" >&2
+        echo "     系统 mpv 的 libmpv 顶替了捆绑库：程序能启动，但超分/插帧/自研 vo 全部失效。" >&2
+        echo "     检查 $LIB_DIR/libmpv.so.2 是否存在、RPATH 是否被改（\$ORIGIN 相对路径）。" >&2
+        LDD_OK=0 ;;
+esac
+}
+run_checks
+
+# ── soname 兼容兜底：系统 ffmpeg/CUDA 大版本升了、旧 soname 不在了 ──────────
+# 做法 = 在 $LIB_DIR（RPATH 首位）建 compat 软链（libavcodec.so.63 → 系统 .so.64），
+# 然后**用 ldd -r 验证无 undefined symbol**才保留：ffmpeg 跨 major 不保证 ABI，
+# 能加载就接受、缺符号就回滚并明确失败——绝不"启动成功但功能悄悄坏掉"。
+COMPAT_SH="$SRC/soname-compat.sh"
+[ -f "$COMPAT_SH" ] || COMPAT_SH="$SRC/scripts/soname-compat.sh"
+if [ "$LDD_OK" -eq 0 ] && [ -f "$COMPAT_SH" ]; then
+    echo "  → 缺 soname，尝试兼容软链（$(basename "$COMPAT_SH")）…"
+    if VSR_LIB_DIR="$LIB_DIR" bash "$COMPAT_SH" \
+            "$BIN_DIR/vsr-player" "$BIN_DIR/mpv-vsr"; then
+        echo "  → 重新自检"; run_checks
+    fi
 fi
+# 跨 major 的可见性：standard 不捆 FFmpeg，NEEDED 也没有版本号了 —— 拿构建期
+# 记录的主版本对照目标机实际装的 libavcodec，不一致必须说出来（能加载 ≠ 行为对：
+# ABI 结构体变化不会体现为 undefined symbol）。
+FF_EXP_FILE="$LIB_DIR/VSR-FFMPEG-MAJOR"
+if [ -f "$FF_EXP_FILE" ]; then
+    FF_WANT="$(tr -d '[:space:]' < "$FF_EXP_FILE")"
+    FF_SO="$(ldd "$BIN_DIR/vsr-player" 2>/dev/null | awk '$1=="libavcodec.so"{print $3; exit}')"
+    FF_HAVE=""
+    [ -n "$FF_SO" ] && FF_HAVE="$(readelf -d "$FF_SO" 2>/dev/null \
+        | sed -n 's/.*(SONAME).*\[libavcodec\.so\.\([0-9]*\)\].*/\1/p')"
+    if [ -n "$FF_HAVE" ] && [ -n "$FF_WANT" ] && [ "$FF_HAVE" != "$FF_WANT" ]; then
+        echo "  ⚠ FFmpeg 主版本不一致：运行时 libavcodec.so.$FF_HAVE，本包构建于 $FF_WANT" >&2
+        echo "     standard 不捆 FFmpeg，跨 major 没有 ABI 承诺：符号能对上不代表行为对。" >&2
+        echo "     要绝对确定性请用 full 变体（自带匹配的 FFmpeg）。" >&2
+    elif [ -n "$FF_HAVE" ]; then
+        echo "  ✅ FFmpeg 主版本匹配（libavcodec.so.$FF_HAVE）"
+    fi
+fi
+[ "$LDD_OK" -eq 1 ] && echo "  ✅ 依赖自检通过"
+[ "$LDD_OK" -eq 1 ] || exit 1
 [ -f "$LIB_DIR/libnvinfer.so.11" ] && RIFE_TRT="✅" || RIFE_TRT="❌"
 # 摘要里的 TRT 字段：无 TRT 库 = VFG-only 包（HAS_TRT 在上方 [3/6] 由同一信号推断），
 # 显示后端名而不是看起来像故障的 "TRT:❌"。
